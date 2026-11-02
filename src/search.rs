@@ -150,7 +150,8 @@ impl Searcher {
     /// Fail early (with a helpful message) if yt-dlp isn't installed.
     pub async fn check_available(&self) -> Result<String> {
         let out = timeout(
-            Duration::from_secs(8),
+            // First-run Python imports can be slow; give yt-dlp room to answer.
+            Duration::from_secs(15),
             Command::new(&self.program)
                 .arg("--version")
                 .kill_on_drop(true)

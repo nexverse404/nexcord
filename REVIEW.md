@@ -48,3 +48,18 @@ Findings were applied, not just listed. The full suite was re-run afterwards
 | Emoji PNG alpha | ✅ 10/10 RGBA, transparent corners, 128×128 |
 
 All checks run against the real 375-crate dependency graph, not stubs.
+
+## Follow-up: startup looked frozen (real user report)
+
+A user ran the release binary and saw only `yt-dlp … ready` before the process
+appeared to hang; they stopped it with Ctrl+C each time and the bot never came
+online. Root cause: serenity's first HTTP request (`/users/@me`, `/gateway/bot`)
+sits inside `Client::builder(...).await` with **no log line and no timeout**, so
+a filtered/slow network looks like a dead process.
+
+| Pass | Fix |
+|---|---|
+| Discord dev + user | Log the whole lifecycle (`connecting`, `API reachable / token accepted as @name`, `opening the gateway`, `gateway READY`, `is online`); distinguish 401 (reset token), 403, 429 and unreachable-network with actionable messages; README gained a "If it doesn't come online" section with the healthy log sequence, invite URL (`bot applications.commands` scope, `permissions=3263488`) and debug command. |
+| Rust dev | Bounded the probe with `reqwest::RequestBuilder::timeout(10 s)` and the client build with `tokio::time::timeout(20 s)`; used `resp.text()` + `serde_json::from_str` instead of enabling reqwest's `json` feature (no new dependency); `.context()` on `client.start()` so anyhow prints a clear chain; raised the `yt-dlp --version` deadline 8 s → 15 s after the user saw a spurious timeout on a cold Python start. |
+
+Re-verified on the real 375-crate graph: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (13 passed), `cargo build --release` (15 MB). A release-binary smoke run in this sandbox now prints the connectivity warning and `Discord gateway exited before the bot came online` instead of hanging silently — `discord.com` is blocked here too.
