@@ -13,7 +13,7 @@ mod search;
 mod ui;
 mod util;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use player::AppState;
 use serenity::{
@@ -154,6 +154,10 @@ async fn main() -> Result<()> {
         Ok(version) => info!("yt-dlp {version} ready — keyless search enabled"),
         Err(e) => warn!("{e:#} — /play and /search need yt-dlp on PATH"),
     }
+    // Discord rejects non-DAVE voice connections with close code 4017. This
+    // build is pinned to songbird 0.6.1, whose Identify advertises
+    // `max_dave_protocol_version` via the pure-Rust `davey` crate.
+    info!("voice engine ready — songbird 0.6.1 with DAVE (E2EE) support");
 
     // Expire search caches / pickers and leave silent voice channels.
     {

@@ -63,3 +63,27 @@ a filtered/slow network looks like a dead process.
 | Rust dev | Bounded the probe with `reqwest::RequestBuilder::timeout(10 s)` and the client build with `tokio::time::timeout(20 s)`; used `resp.text()` + `serde_json::from_str` instead of enabling reqwest's `json` feature (no new dependency); `.context()` on `client.start()` so anyhow prints a clear chain; raised the `yt-dlp --version` deadline 8 s → 15 s after the user saw a spurious timeout on a cold Python start. |
 
 Re-verified on the real 375-crate graph: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (13 passed), `cargo build --release` (15 MB). A release-binary smoke run in this sandbox now prints the connectivity warning and `Discord gateway exited before the bot came online` instead of hanging silently — `discord.com` is blocked here too.
+
+
+## Third pass: line-by-line audit (runtime failures reported by the user)
+
+The user ran the release binary, came online successfully, then hit
+`Driver(Ws(WsClosed(4017 "E2EE/DAVE protocol required")))` and a stuck
+"thinking…" ephemeral message. See [`AUDIT.md`](AUDIT.md) for the full
+per-file table, the sources read and the wiring map.
+
+| Pass | Finding / fix |
+|---|---|
+| Discord dev + user | Discord made DAVE mandatory on 2026-03-01; `songbird 0.5.0` cannot join voice. Pinned `songbird 0.6.1` (DAVE via `davey`) and `serenity 0.12.5`. Added a startup log naming the protocol, README "Voice & DAVE" section and 4017 troubleshooting row. |
+| Rust dev | Migrated to **edition 2024** (Rust ≥1.85). Fixed the audiopus→opus2 `Bitrate` rename, songbird's own `id::ChannelId`, `current_channel()` signature, stale-`Call` cleanup after a failed join, `TrackEvent::Error` listener, `TrackEndHandler` iterating all event pairs, `YT_DLP`/`YT_DLP_ARGS` wiring into `YoutubeDl::new_ytdl_like`, empty-result panics, zero-option select menus, and the `std::env::set_var` tests that edition 2024 makes `unsafe`. |
+| Interaction wiring | `Defer` shows a loading state (serenity source); error fallback changed from the invalid `create_response` to `create_followup`; every interaction has a 25 s deadline (3 s for autocomplete); the picker now works inline and always posts exactly one final followup instead of detaching a task after a "One moment…" card. |
+
+Poise 0.7.1 docs were read for its `FrameworkOptions`/`on_error` contract;
+the framework was evaluated but not adopted — `AUDIT.md` documents why (component
+interactions are outside its model). Its "always reply" guarantee is implemented
+directly in `dispatch`.
+
+Re-verified against the real 443-package graph on Rust 1.99.0:
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, 13 tests,
+`cargo build --release` (16 MB, links `libopus` and `davey`). Live DAVE
+negotiation still needs a real Discord voice session.

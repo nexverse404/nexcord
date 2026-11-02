@@ -1,6 +1,6 @@
 //! Environment configuration. Everything has a sane default except the bot token.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::env;
 use tracing::warn;
 
@@ -10,6 +10,9 @@ pub struct Config {
     /// `Some` => register commands in a single guild (instant, great for dev).
     pub guild_id: Option<u64>,
     pub yt_dlp: String,
+    /// Extra raw yt-dlp flags, shared by search, resolve and playback.
+    /// Needed for cookies / PO tokens / custom extractor args on some sites.
+    pub yt_dlp_args: Vec<String>,
     pub default_volume: f32,
     pub max_queue: usize,
     pub search_results: usize,
@@ -49,7 +52,13 @@ where
 }
 
 fn colour(key: &str, default: u32) -> u32 {
-    let raw = var(key, "");
+    parse_colour(&var(key, ""), default)
+}
+
+/// Pure parser. On edition 2024 `std::env::set_var` is `unsafe`, so tests call
+/// this directly instead of mutating the process environment.
+fn parse_colour(raw: &str, default: u32) -> u32 {
+    let raw = raw.trim();
     if raw.is_empty() {
         return default;
     }
@@ -81,6 +90,10 @@ impl Config {
             token,
             guild_id: var("GUILD_ID", "").parse::<u64>().ok().filter(|id| *id > 0),
             yt_dlp: var("YT_DLP", "yt-dlp"),
+            yt_dlp_args: var("YT_DLP_ARGS", "")
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
             default_volume,
             max_queue: num::<usize>("MAX_QUEUE", 200).clamp(1, 1000),
             search_results,
@@ -120,19 +133,15 @@ pub fn load() -> Result<Config> {
 
 #[cfg(test)]
 mod tests {
-    use super::colour;
+    use super::parse_colour;
 
     #[test]
     fn parses_accent_colours() {
-        assert_eq!(colour("ACCENT", 0x6c5ce7), 0x6c5ce7);
-        assert_eq!(colour("", 0x6c5ce7), 0x6c5ce7);
-        // `0x` / `#` / plain-hex / decimal are all accepted.
-        std::env::set_var("NX_TEST_ACCENT", "0x7B6CF6");
-        assert_eq!(colour("NX_TEST_ACCENT", 0), 0x7b6cf6);
-        std::env::set_var("NX_TEST_ACCENT", "#35D6E8");
-        assert_eq!(colour("NX_TEST_ACCENT", 0), 0x35d6e8);
-        std::env::set_var("NX_TEST_ACCENT", "not-a-colour");
-        assert_eq!(colour("NX_TEST_ACCENT", 42), 42);
-        std::env::remove_var("NX_TEST_ACCENT");
+        assert_eq!(parse_colour("", 0x6c5ce7), 0x6c5ce7);
+        assert_eq!(parse_colour("0x7B6CF6", 0), 0x7b6cf6);
+        assert_eq!(parse_colour("#35D6E8", 0), 0x35d6e8);
+        assert_eq!(parse_colour("7B6CF6", 0), 0x7b6cf6);
+        assert_eq!(parse_colour("7106790", 0), 7_106_790);
+        assert_eq!(parse_colour("not-a-colour", 42), 42);
     }
 }

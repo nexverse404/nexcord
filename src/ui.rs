@@ -424,6 +424,16 @@ pub fn search_embed(query: &str, tracks: &[Track], provider: Provider) -> Create
 }
 
 pub fn search_components(session: &str, tracks: &[Track]) -> Vec<CreateActionRow> {
+    if tracks.is_empty() {
+        // Discord rejects a StringSelect with an empty option list.
+        return vec![CreateActionRow::Buttons(vec![button(
+            "nx:cancel".into(),
+            "cancel",
+            "Cancel",
+            ButtonStyle::Secondary,
+            false,
+        )])];
+    }
     let options: Vec<CreateSelectMenuOption> = tracks
         .iter()
         .take(25)

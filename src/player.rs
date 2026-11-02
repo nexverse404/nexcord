@@ -11,7 +11,7 @@ use crate::{
     ui::{self, Assets},
     util,
 };
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serenity::{
     builder::{CreateActionRow, CreateEmbed, CreateMessage, EditMessage},
@@ -20,16 +20,16 @@ use serenity::{
     model::prelude::{ChannelId, GuildId, MessageId, UserId},
 };
 use songbird::{
+    Event as VoiceEvent, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
     driver::Bitrate,
     input::{HttpRequest, Input, YoutubeDl},
     tracks::TrackHandle,
-    Event as VoiceEvent, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
 };
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -153,6 +153,9 @@ pub struct AppState {
     pub voice: Arc<Songbird>,
     pub client: reqwest::Client,
     pub searcher: Searcher,
+    /// Deliberately leaked once: songbird's `YoutubeDl<'static>` needs a
+    /// `&'static str` program name. One tiny allocation for the process life.
+    pub ytdl_program: &'static str,
     pub assets: Assets,
     pub started: Instant,
     /// Caps background autocomplete searches so rapid typing can't spawn a
@@ -167,9 +170,11 @@ impl AppState {
     pub fn new(config: Config, http: Arc<Http>, voice: Arc<Songbird>) -> Self {
         let searcher = Searcher::new(
             config.yt_dlp.clone(),
+            config.yt_dlp_args.clone(),
             config.search_results,
             config.search_cache_ttl,
         );
+        let ytdl_program: &'static str = Box::leak(config.yt_dlp.clone().into_boxed_str());
         let assets = Assets::new(config.asset_base_url.clone());
         Self {
             config,
@@ -177,6 +182,7 @@ impl AppState {
             voice,
             client: reqwest::Client::new(),
             searcher,
+            ytdl_program,
             assets,
             started: Instant::now(),
             inflight: AtomicUsize::new(0),
@@ -248,6 +254,8 @@ impl AppState {
 
         let current = app.voice.get(guild_id);
         let already_there = match &current {
+            // songbird 0.6 has its own `id::ChannelId(NonZeroU64)`; compare the
+            // raw u64 so the two id newtypes never need to be confused.
             Some(call) => {
                 call.lock().await.current_channel().map(|c| c.0.get()) == Some(channel_id.get())
             }
@@ -255,11 +263,20 @@ impl AppState {
         };
 
         if !already_there {
-            let call = app
-                .voice
-                .join(guild_id, channel_id)
-                .await
-                .map_err(|e| anyhow!("couldn't join voice: {e:?}"))?;
+            let call = match app.voice.join(guild_id, channel_id).await {
+                Ok(call) => call,
+                Err(e) => {
+                    // A refused join leaves a stale Call in songbird's map.
+                    // Drop it so the next /play performs a clean reconnect.
+                    let _ = app.voice.remove(guild_id).await;
+                    let state = app.guild(guild_id).await;
+                    state.lock().await.voice_channel = None;
+                    bail!(
+                        "couldn't join voice: {e}. Discord requires DAVE (E2EE) for voice; \
+                         rebuild with songbird 0.6.1+ if this mentions 4017"
+                    );
+                }
+            };
             let mut handler = call.lock().await;
             if let Err(e) = handler.deafen(true).await {
                 debug!("deafen failed (harmless): {e:?}");
@@ -267,10 +284,17 @@ impl AppState {
             // Stereo Opus at an explicit high bitrate. Songbird's YoutubeDl source
             // chooses the best audio-only stream (usually WebM/Opus), so most
             // tracks are passed through without a lossy re-encode.
-            handler.set_bitrate(Bitrate::BitsPerSecond(app.config.opus_bitrate));
+            handler.set_bitrate(Bitrate::Bits(app.config.opus_bitrate));
+            let on_end = TrackEndHandler {
+                app: Arc::clone(app),
+                guild_id,
+            };
+            handler.add_global_event(VoiceEvent::Track(TrackEvent::End), on_end);
+            // A lazy yt-dlp source can fail *after* play_input returns. Without
+            // an Error listener the queue would sit on a dead track forever.
             handler.add_global_event(
-                VoiceEvent::Track(TrackEvent::End),
-                TrackEndHandler {
+                VoiceEvent::Track(TrackEvent::Error),
+                TrackErrorHandler {
                     app: Arc::clone(app),
                     guild_id,
                 },
@@ -363,7 +387,9 @@ impl AppState {
         let input: Input = if track.source == Source::Direct {
             HttpRequest::new(self.client.clone(), track.url.clone()).into()
         } else {
-            let source: YoutubeDl<'static> = YoutubeDl::new(self.client.clone(), track.url.clone());
+            let source: YoutubeDl<'static> =
+                YoutubeDl::new_ytdl_like(self.ytdl_program, self.client.clone(), track.url.clone())
+                    .user_args(self.config.yt_dlp_args.clone());
             source.into()
         };
         let handle = {
@@ -854,17 +880,42 @@ struct TrackEndHandler {
 #[async_trait]
 impl VoiceEventHandler for TrackEndHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<VoiceEvent> {
-        let ended = match ctx {
-            EventContext::Track(list) => list.last().map(|pair| pair.1.uuid().to_string()),
-            _ => None,
-        };
-        if let Some(uuid) = ended {
-            let app = self.app.clone();
-            let guild_id = self.guild_id;
-            // Never do I/O or lock the driver from inside the mixer tick.
-            tokio::spawn(async move {
-                app.on_track_end(guild_id, &uuid).await;
-            });
+        if let EventContext::Track(list) = ctx {
+            for pair in *list {
+                let uuid = pair.1.uuid().to_string();
+                let app = self.app.clone();
+                let guild_id = self.guild_id;
+                // Never do I/O or lock the driver from inside the mixer tick.
+                tokio::spawn(async move {
+                    app.on_track_end(guild_id, &uuid).await;
+                });
+            }
+        }
+        None
+    }
+}
+
+/// A track that fails to initialise (bad URL, yt-dlp error, unsupported codec)
+/// never emits `End`. Treat it exactly like an ended track so the queue keeps
+/// moving instead of freezing with `current` set forever.
+struct TrackErrorHandler {
+    app: Arc<AppState>,
+    guild_id: GuildId,
+}
+
+#[async_trait]
+impl VoiceEventHandler for TrackErrorHandler {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<VoiceEvent> {
+        if let EventContext::Track(list) = ctx {
+            for pair in *list {
+                let uuid = pair.1.uuid().to_string();
+                warn!(guild_id = %self.guild_id, %uuid, "track failed to start; advancing queue");
+                let app = self.app.clone();
+                let guild_id = self.guild_id;
+                tokio::spawn(async move {
+                    app.on_track_end(guild_id, &uuid).await;
+                });
+            }
         }
         None
     }

@@ -13,7 +13,7 @@
 //!   parallel. Nothing is downloaded until a track actually plays.
 
 use crate::util::{normalize, tokens};
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -113,15 +113,18 @@ struct Cached {
 
 pub struct Searcher {
     program: String,
+    /// Extra flags appended to every yt-dlp invocation (cookies, PO tokens…).
+    extra: Vec<String>,
     cache: Mutex<HashMap<String, Cached>>,
     limit: usize,
     ttl: Duration,
 }
 
 impl Searcher {
-    pub fn new(program: String, limit: usize, ttl: Duration) -> Self {
+    pub fn new(program: String, extra: Vec<String>, limit: usize, ttl: Duration) -> Self {
         Self {
             program,
+            extra,
             cache: Mutex::new(HashMap::new()),
             limit,
             ttl,
@@ -315,10 +318,16 @@ impl Searcher {
     }
 
     async fn spawn(&self, args: &[String], limit: Duration) -> Result<String> {
+        let mut all = args.to_vec();
+        // Keep the URL/query as the final argument: insert user flags before it.
+        if let Some(target) = all.pop() {
+            all.extend(self.extra.iter().cloned());
+            all.push(target);
+        }
         let output = timeout(
             limit,
             Command::new(&self.program)
-                .args(args)
+                .args(&all)
                 .kill_on_drop(true)
                 .output(),
         )

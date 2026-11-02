@@ -1,5 +1,6 @@
 # ─── build ────────────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+# Rust 1.85+ is required for edition 2024; use a current stable image.
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \

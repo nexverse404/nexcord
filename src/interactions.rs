@@ -6,29 +6,56 @@ use crate::{
     ui::{self, Tone},
     util,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow, bail};
 use serenity::{builder::*, client::Context, model::prelude::*};
 use std::{
-    sync::{atomic::Ordering, Arc},
-    time::Instant,
+    sync::{Arc, atomic::Ordering},
+    time::{Duration, Instant},
 };
 use tracing::warn;
+
+/// Discord shows a "thinking…" placeholder while an interaction is deferred.
+/// Poise's documented `FrameworkError`/`on_error` contract is that *every*
+/// command produces a reply; we enforce the same invariant here with a hard
+/// deadline so a hung yt-dlp/voice join can never leave a stuck placeholder.
+const INTERACTION_DEADLINE: Duration = Duration::from_secs(25);
+const AUTOCOMPLETE_DEADLINE: Duration = Duration::from_secs(3);
+
+async fn bounded<F>(future: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::time::timeout(INTERACTION_DEADLINE, future)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "this took too long — please try again (check yt-dlp)"
+            ))
+        })
+}
 
 pub async fn dispatch(ctx: Context, interaction: Interaction, app: Arc<AppState>) {
     match interaction {
         Interaction::Command(command) => {
-            if let Err(e) = handle_command(&ctx, &command, &app).await {
+            if let Err(e) = bounded(handle_command(&ctx, &command, &app)).await {
                 warn!("/{} failed: {e:#}", command.data.name);
                 report_command_error(&ctx, &command, &e).await;
             }
         }
         Interaction::Autocomplete(command) => {
-            if let Err(e) = handle_autocomplete(&ctx, &command, &app).await {
-                warn!("autocomplete failed: {e:#}");
+            match tokio::time::timeout(
+                AUTOCOMPLETE_DEADLINE,
+                handle_autocomplete(&ctx, &command, &app),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("autocomplete failed: {e:#}"),
+                Err(_) => warn!("autocomplete exceeded Discord's 3 s deadline"),
             }
         }
         Interaction::Component(component) => {
-            if let Err(e) = handle_component(&ctx, &component, &app).await {
+            if let Err(e) = bounded(handle_component(&ctx, &component, &app)).await {
                 warn!("component {} failed: {e:#}", component.data.custom_id);
                 report_component_error(&ctx, &component, &e).await;
             }
@@ -125,14 +152,14 @@ async fn report_command_error(ctx: &Context, cmd: &CommandInteraction, e: &anyho
     {
         return;
     }
+    // After a deferral, create_response would be rejected ("already
+    // acknowledged"). A followup is the only valid fallback.
     let _ = cmd
-        .create_response(
+        .create_followup(
             ctx,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .ephemeral(true)
-                    .embed(embed),
-            ),
+            CreateInteractionResponseFollowup::new()
+                .ephemeral(true)
+                .embed(embed),
         )
         .await;
 }
@@ -194,8 +221,11 @@ async fn handle_command(
             } else if pick {
                 open_picker(ctx, cmd, app, guild, &query, provider).await
             } else {
-                let mut tracks = app.searcher.search(&query, provider).await?;
-                let best = tracks.remove(0);
+                let tracks = app.searcher.search(&query, provider).await?;
+                let best = tracks
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("no matches found for `{query}`"))?;
                 let result = AppState::enqueue(
                     app,
                     ctx,
@@ -458,6 +488,9 @@ async fn open_picker(
     provider: Provider,
 ) -> Result<()> {
     let tracks = app.searcher.search(query, provider).await?;
+    if tracks.is_empty() {
+        bail!("no matches found for `{query}` — try a direct link");
+    }
     let session = app.new_session(SearchSession {
         at: Instant::now(),
         guild_id: guild,
@@ -615,7 +648,7 @@ async fn handle_component(
             .await;
         }
         "nx:qprev" | "nx:qnext" | "nx:qclose" => {
-            return handle_queue_button(ctx, comp, app, guild, id).await
+            return handle_queue_button(ctx, comp, app, guild, id).await;
         }
         _ if id.starts_with("nx:top:") => {
             // strip_once, not trim_start_matches: the latter strips *repeated*
@@ -737,8 +770,13 @@ async fn close_picker(
     Ok(())
 }
 
-/// A search picker selection. Respond instantly, then enqueue in a detached
-/// task (joining voice may take a few seconds) and report back with a followup.
+/// A search picker selection.
+///
+/// Responds immediately with an `UpdateMessage` (a *visible* "Adding…" card,
+/// not a deferred "thinking…" placeholder), then does the work inline under a
+/// deadline and **always** posts one followup with the final outcome. The old
+/// detached-task version could leave "One moment…" on screen forever if the
+/// enqueue hung or the task panicked.
 async fn handle_pick(
     ctx: &Context,
     comp: &ComponentInteraction,
@@ -762,63 +800,66 @@ async fn handle_pick(
     };
     let session = app
         .take_session(&session_id)
-        .filter(|s| s.guild_id == guild);
+        .filter(|s| s.guild_id == guild && s.user_id == comp.user.id);
 
     close_picker(
         ctx,
         comp,
         ui::notice(
-            "One moment…",
-            "Adding your track to the queue.",
+            "Adding your track…",
+            "Resolving the stream and joining voice. This takes a few seconds.",
             Tone::Neutral,
         ),
     )
     .await?;
 
-    let ctx: Context = (*ctx).clone();
-    let app: Arc<AppState> = (*app).clone();
-    let comp: ComponentInteraction = (*comp).clone();
-    let requester = comp.user.name.clone();
-    tokio::spawn(async move {
-        let embed = match session {
-            Some(session) => match session.tracks.get(index).cloned() {
-                Some(track) => {
-                    match AppState::enqueue(
-                        &app,
-                        &ctx,
+    let embed = match session {
+        Some(session) => match session.tracks.get(index).cloned() {
+            Some(track) => {
+                let requester = comp.user.name.clone();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    AppState::enqueue(
+                        app,
+                        ctx,
                         guild,
                         session.user_id,
                         &requester,
                         vec![track],
                         session.text_channel,
-                    )
-                    .await
-                    {
-                        Ok(result) => ui::added_embed(&result.first, result.position),
-                        Err(e) => ui::notice("Couldn't add that track", &e.to_string(), Tone::Bad),
-                    }
+                    ),
+                )
+                .await;
+                match outcome {
+                    Ok(Ok(result)) => ui::added_embed(&result.first, result.position),
+                    Ok(Err(e)) => ui::notice("Couldn't add that track", &e.to_string(), Tone::Bad),
+                    Err(_) => ui::notice(
+                        "Timed out",
+                        "Joining voice or resolving the stream took too long. Try `/play` again.",
+                        Tone::Warn,
+                    ),
                 }
-                None => ui::notice(
-                    "Invalid selection",
-                    "That result no longer exists.",
-                    Tone::Bad,
-                ),
-            },
+            }
             None => ui::notice(
-                "Picker expired",
-                "Run `/search` again — pickers last 10 minutes.",
-                Tone::Warn,
+                "Invalid selection",
+                "That result no longer exists.",
+                Tone::Bad,
             ),
-        };
-        let _ = comp
-            .create_followup(
-                &ctx,
-                CreateInteractionResponseFollowup::new()
-                    .ephemeral(true)
-                    .embed(embed),
-            )
-            .await;
-    });
+        },
+        None => ui::notice(
+            "Picker expired",
+            "Run `/search` again — pickers last 10 minutes and only you can use yours.",
+            Tone::Warn,
+        ),
+    };
+
+    comp.create_followup(
+        ctx,
+        CreateInteractionResponseFollowup::new()
+            .ephemeral(true)
+            .embed(embed),
+    )
+    .await?;
     Ok(())
 }
 
