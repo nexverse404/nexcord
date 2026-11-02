@@ -119,3 +119,18 @@ built `libopus`:
 **Not verifiable in this sandbox:** a live Discord voice session. `discord.com`
 egress is blocked here, so DAVE negotiation and actual audio output can only be
 confirmed on the user's machine with a valid token and a joined voice channel.
+
+
+## Follow-up: UX / runtime pass (screenshot + 19:45 log)
+
+| File | Finding | Fix |
+|---|---|---|
+| `src/search.rs` | `cached()` required an exact key, so `phir`/`phire`/`phiriye dao` each missed; `tokio::join!` waited for a 20 s SoundCloud timeout, producing `partial search failure … yt-dlp timed out` and making `/play` exceed its 25 s deadline. | `suggestions()` with prefix-aware cache matching; `quick_search()` (bounded YouTube-only); `PROVIDER_DEADLINE = 9 s` per catalogue with timeout treated as empty; `default_ytdlp_args()` (`--socket-timeout 6`, `--retries 1`, `youtube:player_client=tv,web_safari`); `resolve` 15 s / `run` 9 s; extra args inserted before the URL. |
+| `src/interactions.rs` | Autocomplete returned an empty response on a miss (Discord shows nothing), and the warm task was capped at 2 with no de-duplication. | Always emit a `Search for "…"` choice (its value is a real query `/play` can resolve); `warming: Mutex<HashSet<String>>` de-dupes identical prefixes; deadline 25 s → 30 s. |
+| `src/ui.rs` | `▰`/`▱` progress bar renders as a row of empty boxes; blockquote `>` lines, empty spacer lines, `VOL`/`LOOP`/`UP NEXT` inline-code labels and spaced `N E X C O R D` headers looked amateur; the playing card had both a full-width banner and a thumbnail. | Full rewrite to the professional hierarchy used by Chip/Hade/MusikBot/PlexBot. One metadata line, one progress line, one status line, no quotes, no code fences, short plain labels, `Loop · …` / `Vol −/+` buttons. Playing card shows **only** the track's album art; the generated wave/cover appear on the idle card only. |
+| `src/ui.rs` (`Assets`) | `attachments()` always uploaded MARK + WAVE + COVER. A playing embed referenced MARK (author/footer), WAVE (image) and the **remote** track thumbnail — so COVER was unreferenced and Discord rendered it as a standalone full-size image above the panel. | `attachments(idle)` now returns exactly the files the embed references; every panel edit calls `EditMessage::attachments(EditAttachments::new())` to remove stale files. |
+| `src/player.rs` | `/panel` called `reset_panel`, which cleared the stored message id and posted a new panel without deleting the old one → two "CONTROL PANEL" cards. Concurrent refreshes could also each post one. A `TrackEvent::Error` only logged and advanced, leaving the user with no explanation. | `reset_panel` deletes the old message; `post_panel` guards on `posting`/`panel.is_some()`; `on_track_error` posts an actionable yt-dlp notice then advances. Playback now uses the same hardened yt-dlp args as search. |
+| `src/util.rs` | `progress_bar` used `▰`/`▱`. | `━` filled + `●` knob + `─` unfilled; fixed-width unit test. |
+| `README.md` / `REVIEW.md` / `assets/README.md` | Embed examples still described the old quote-heavy design and the old asset roles. | Faithful text renderings of the new embeds, new troubleshooting rows, updated asset usage notes. |
+
+No dashboard/HTML mock was added — the user explicitly rejected that earlier.

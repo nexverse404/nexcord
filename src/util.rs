@@ -67,23 +67,24 @@ pub fn clean_md(s: &str) -> String {
     out
 }
 
-/// A compact, monospace-friendly progress bar.
+/// A single-line progress bar with a position knob.
+///
+/// `▰`/`▱` (the old bar) render as a row of empty boxes in Discord's font, which
+/// looks broken at 0:00. `━`, `─` and `●` are box-drawing characters that join
+/// into one continuous line — the same shape professional players use.
 pub fn progress_bar(position: Duration, total: Option<Duration>, width: usize) -> String {
+    let width = width.max(2);
     let total = total.unwrap_or_default();
     let ratio = if total.as_secs_f64() > 0.0 {
         (position.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let filled = (ratio * width as f64).round() as usize;
+    let filled = (ratio * (width - 1) as f64).round() as usize;
     let mut bar = String::with_capacity(width * 3);
-    for i in 0..width {
-        if i < filled {
-            bar.push('▰');
-        } else {
-            bar.push('▱');
-        }
-    }
+    bar.push_str(&"━".repeat(filled));
+    bar.push('●');
+    bar.push_str(&"─".repeat(width - 1 - filled));
     bar
 }
 
@@ -185,6 +186,23 @@ mod tests {
     fn truncates_unicode() {
         assert_eq!(truncate("日本語の曲名です", 4), "日本語…");
         assert_eq!(truncate("abc", 0), "");
+    }
+
+    #[test]
+    fn progress_bar_has_one_knob_and_constant_width() {
+        let total = Some(Duration::from_secs(100));
+        let empty = progress_bar(Duration::ZERO, total, 16);
+        let half = progress_bar(Duration::from_secs(50), total, 16);
+        let full = progress_bar(Duration::from_secs(100), total, 16);
+        assert_eq!(empty.chars().filter(|c| *c == '●').count(), 1);
+        assert_eq!(half.chars().filter(|c| *c == '●').count(), 1);
+        assert_eq!(full.chars().filter(|c| *c == '●').count(), 1);
+        assert_eq!(empty.chars().count(), 16);
+        assert_eq!(half.chars().count(), 16);
+        assert_eq!(full.chars().count(), 16);
+        assert!(half.contains('━'));
+        assert!(empty.contains('─'));
+        assert!(!empty.contains('▱'));
     }
 
     #[test]

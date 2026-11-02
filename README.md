@@ -96,7 +96,11 @@ timeout, which is why older builds could look frozen there.
 | Bot is online but `Unknown Interaction` / commands missing | Re-invite with the `applications.commands` scope and re-run so commands register. |
 | `couldn't join voice … 4017 … E2EE/DAVE protocol required` | You are running an **old binary**. `git pull` and `cargo build --release` — this build pins `songbird 0.6.1` (DAVE). See [Voice & DAVE](#voice--dave). |
 | A private "Nexcord is thinking…" that never resolves | Fixed in this build: every interaction has a 25 s deadline and always produces a reply (`edit_response`, falling back to `create_followup`). If it persists, check the log for `/play failed`. |
-| `/play` finds a track but nothing plays | Check `yt-dlp` on the host (`YT_DLP_ARGS` for cookies / PO tokens). The bot now listens for `TrackEvent::Error` and advances the queue instead of freezing. |
+| `/play` finds a track but nothing plays | Check `yt-dlp -g "<url>"` on the host. YouTube may need `YT_DLP_ARGS="--cookies /app/cookies.txt --extractor-args youtube:player_client=tv,web_safari"`. The bot now listens for `TrackEvent::Error`, posts an actionable notice and advances the queue instead of freezing silently. |
+| `yt-dlp timed out` / `partial search failure` for SoundCloud | Normal on a slow network: that provider is skipped after 9 s and YouTube results are still used. The old 20 s stall that caused `/play` to time out is gone. |
+| Autocomplete shows nothing | Fixed: prefix cache hits plus a guaranteed `Search for "…"` choice mean the dropdown is never empty. |
+| Two "NEXCORD / CONTROL PANEL" messages | `/panel` now deletes the old card before posting a new one, and concurrent refreshes are guarded so only one panel can exist per guild. |
+| A big square image above the panel | Fixed: every attachment is referenced by the embed and every panel edit replaces the attachment set, so Discord never renders an unreferenced file standalone. |
 
 Invite URL (replace `CLIENT_ID`, from Developer Portal → General Information):
 
@@ -160,73 +164,73 @@ row 2   🔉 −      🔊 +                 🔀 Shuffle   📜 Queue   🔄 Re
 
 ## What the embeds look like
 
-Every embed is built in `src/ui.rs`: one violet accent `#6c5ce7`, dark surfaces, monospace metadata, quote-style (`>`) descriptions, no decorative clutter. Three pieces of original artwork are attached once to the panel — `nexcord-mark.jpg` (author/footer icon), `nexcord-wave.jpg` (wide banner), `nexcord-cover.jpg` (thumbnail fallback). `▌` below is the embed's coloured left border. Every glyph shown is a **slot**
-from [`emojis.toml`](emojis.toml): when a custom application emoji is available
-it renders as `<:nx_skip:…>`, otherwise the generic Unicode glyph below is used.
+Every embed is built in `src/ui.rs`. The layout follows the players used by
+professional music bots (Chip, Hade, MusikBot, PlexBot): **header → clickable
+track title → one metadata line → one progress line → one status line → small
+footer → two compact button rows**. No quote blocks, no empty `>` spacer lines,
+no walls of inline-code backticks, no `N E X C O R D` letter spacing.
+
+While a track plays the panel shows **exactly one image** — the track's album
+art as a small right-hand thumbnail. The generated wave banner and cover art
+appear only on the idle card. Every uploaded attachment is referenced by the
+embed, so Discord never renders a stray full-size image above the message.
+`▌` below is the embed's coloured left border; glyphs are slots from
+[`emojis.toml`](emojis.toml) (generic Unicode when no custom emoji is uploaded).
 
 ### `/panel` — playing · accent `#6c5ce7`
 
 ```
-▌ [mark] N E X C O R D   /   CONTROL PANEL
+▌ NEXCORD  ·  NOW PLAYING                          [album art thumbnail]
+│ Miles - Phiriye Dao (Official Audio)          ← clickable → source URL
 │
-│ Says                                     ← title, clickable → source URL
-│
-│ > ▶️  Playing   ·   🟢 connected
-│ > Nils Frahm  ·  `8:32`  ·  ☁️
-│ >
-│ > `2:41`   ▰▰▰▰▱▱▱▱▱▱▱▱▱   `8:32`
-│ >
-│ > `VOL` **100%**   ·   `LOOP` **Off**   ·   `UP NEXT` **7**
+│ ▶️  **Playing**  ·  🟢 Connected
+│ **MILES**  ·  4:34  ·  ▶️ YouTube
+│ 0:00  ━●──────────────  4:34
+│ Volume **100%**  ·  Loop **Off**  ·  **0** in queue
 │
 │ UP NEXT
-│ ` 1.`  Says (Live at Funkhaus, Berlin)  ·  `10:04`
-│ ` 2.`  Says — Rework  ·  `5:31`
-│ ` 3.`  Familiar  ·  `4:28`
-│ … and **4** more
+│ `1.`  Says (Live at Funkhaus, Berlin) — 10:04
+│ `2.`  Says — Rework — 5:31
 │
-│                    [nexcord-wave.jpg · full-width banner]
-│                                        [cover thumbnail]
-│
-│ [mark] requested by kai   ·   48 kHz stereo Opus   ·   no API keys
+│ requested by ntsc  ·  NEXCORD
 └
-  [⏪ −15s] [⏸ Pause] [⏭ Skip] [⏹ Stop] [🔁 Off]
-  [🔉 −]    [🔊 +]    [🔀 Shuffle] [📜 Queue] [🔄 Refresh]
+  [⏪ −15s] [⏸ Pause] [⏭ Skip] [⏹ Stop] [🔁 Loop · Off]
+  [🔉 Vol −] [🔊 Vol +] [🔀 Shuffle] [📜 Queue] [🔄 Refresh]
 ```
+
+Paused → amber `#f5a524`, `⏸ **Paused**`, primary button `▶️ Resume`.
+`━`/`─`/`●` form one continuous progress line (the old `▰▱` bar rendered as a
+row of empty boxes in Discord's font).
 
 ### `/panel` — idle · accent `#2b2f3a`, buttons disabled
 
 ```
-▌ [mark] N E X C O R D   /   CONTROL PANEL
+▌ NEXCORD  ·  NOW PLAYING
 │ Nothing playing
-│ > ⚪  **Idle**
-│ >
-│ > `/play` a song, a link or a playlist — or use `/search` to pick an exact match.
-│ > Works with YouTube, SoundCloud, Bandcamp and 1000+ other sites. No API key needed.
-│                    [nexcord-wave.jpg]      [nexcord-cover.jpg]
-│ [mark] N E X C O R D   ·   fast · clean · keyless
+│ **Ready when you are.**
+│ `/play` a song, a link or a playlist — or `/search` to pick an exact match.
+│ YouTube, SoundCloud, Bandcamp and 1000+ sites. No API key needed.
+│              [nexcord-wave.jpg · full-width banner]  [nexcord-cover.jpg]
+│ NEXCORD  ·  fast · clean · keyless
 ```
-
-Paused → accent becomes amber `#f5a524`, status reads `⏸ Paused`, primary button becomes `▶️ Resume`.
 
 ### `/play` — confirmation · green `#3ddc97`
 
 ```
-▌ N E X C O R D   /   QUEUED
+▌ NEXCORD  ·  QUEUED
 │ Says                                     ← clickable
-│ > ▶️  Playing now        (or `📥  Added to queue  ·  position 3`)
-│ > **Nils Frahm**  ·  `8:32`  ·  SoundCloud
-│ >
-│ > requested by **kai**
+│ ▶️  **Playing now**        (or `📥  **Added to queue · position 3**`)
+│ Nils Frahm  ·  8:32  ·  SoundCloud
+│
+│ requested by **kai**
+│ NEXCORD
 ```
 
 ### `/search` — exact-match picker (ephemeral: only you see it)
 
 ```
-▌ N E X C O R D   /   SEARCH
-│ Choose a track
-│ > 🔎  **nils frahm says**
-│ > YouTube + SoundCloud  ·  8 matches  ·  pick the exact one
-│
+▌ NEXCORD  ·  SEARCH
+│ Results for "nils frahm says"
 │ ` 1.`  Says
 │        Nils Frahm · 8:32 · SoundCloud
 │ ` 2.`  Says (Live at Funkhaus, Berlin)
@@ -234,7 +238,7 @@ Paused → accent becomes amber `#f5a524`, status reads `⏸ Paused`, primary bu
 │ ` 3.`  Says — Rework
 │        Nils Frahm & Ólafur Arnalds · 5:31 · Bandcamp
 │ …
-│ exact matches · no API keys · expires in 10 min
+│ YouTube + SoundCloud  ·  8 matches  ·  pick one below  ·  expires in 10 min
 └
   ┌ Pick the exact track…            ⌄ ┐   ← select menu, up to 25 options
   │ 1. Says                            │
@@ -246,40 +250,40 @@ Paused → accent becomes amber `#f5a524`, status reads `⏸ Paused`, primary bu
 ### `/queue` — paginated
 
 ```
-▌ N E X C O R D   /   QUEUE
+▌ NEXCORD  ·  QUEUE
+│ Up next  ·  12 tracks
 │ NOW PLAYING
 │ **Says**
-│ Nils Frahm  ·  `8:32`
+│ Nils Frahm  ·  8:32
 │
 │ ` 1.`  **Says (Live at Funkhaus, Berlin)**
-│        Nils Frahm  ·  `10:04`  ·  YouTube
+│        Nils Frahm  ·  10:04  ·  YouTube
 │ ` 2.`  **Says — Rework**
-│        Nils Frahm & Ólafur Arnalds  ·  `5:31`  ·  Bandcamp
+│        Nils Frahm & Ólafur Arnalds  ·  5:31  ·  Bandcamp
 │ …
-│ page 1/2   ·   12 queued   ·   1:04:22 remaining   ·   Off loop
+│ page 1/2  ·  12 queued  ·  1:04:22 remaining  ·  loop Off
 └
   [◀ Prev] [📄 1/2] [▶ Next] [✖ Close]
 ```
 
-Empty queue → `> The queue is empty.` / `> /play something, or /search for an exact match.`
+Empty queue → `The queue is empty. /play something, or /search for an exact match.`
 
 ### `/now` — compact card (ephemeral)
 
 ```
-▌ N E X C O R D   /   NOW PLAYING
+▌ NEXCORD  ·  NOW PLAYING                      [album art thumbnail]
 │ Says                                     ← clickable
-│ > ▶️  Playing  ·  **Nils Frahm**
-│ > `8:32`  ·  SoundCloud
-│ >
-│ > `2:41`   ▰▰▰▰▱▱▱▱▱▱▱▱▱   `8:32`
-│ >
-│ > `VOL` **100%**   ·   `LOOP` **Off**   ·   `UP NEXT` **7**
-│ requested by kai
+│ ▶️  **Playing**  ·  🟢 Connected
+│ **Nils Frahm**  ·  8:32  ·  ☁️ SoundCloud
+│ 2:41  ━━━━●──────────  8:32
+│ Volume **100%**  ·  Loop **Off**  ·  **7** in queue
+│ requested by kai  ·  NEXCORD
 ```
 
 ### Button / command replies — ephemeral toasts
 
-`ui::notice()` makes a compact one-line embed for `/pause`, `/skip`, `/volume`, `/loop`, button presses and errors. Title = `emoji + text`, footer = `N E X C O R D  ·  keep it simple`:
+`ui::notice()` makes a compact embed for `/pause`, `/skip`, `/volume`, `/loop`,
+button presses and errors. Title = `emoji + text`, footer = `NEXCORD`:
 
 ```
 ✓  Skipped             green  #3ddc97    "On to the next track."
@@ -291,14 +295,14 @@ Empty queue → `> The queue is empty.` / `> /play something, or /search for an 
 ### `/help` and `/stats`
 
 ```
-▌ N E X C O R D   /   HELP
+▌ NEXCORD  ·  HELP
 │ Everything, in one place
-│ > A keyless music bot. Type a song name, paste a link, or pick an exact result.
+│ A keyless music bot. Type a song name, paste a link, or pick an exact result.
 │ PLAYBACK        /play /search /pause /skip /stop /seek /join /leave /panel
 │ QUEUE & SOUND   /queue /shuffle /loop /remove /volume
 │ SEARCH, NO KEYS Searches YouTube and SoundCloud in parallel …
 │ INFO            /now /stats /help
-│ built in Rust · serenity + songbird · 48 kHz stereo Opus
+│ NEXCORD  ·  built in Rust  ·  48 kHz stereo Opus
 ```
 
 `/stats` uses the same layout with title `Runtime` and fields `Uptime`, `Voice sessions`, `Playing now`, `Tracks queued`, `Search cache`, `Open pickers`.
@@ -322,7 +326,8 @@ Empty queue → `> The queue is empty.` / `> /play something, or /search for an 
 
 * **Two catalogues at once** — rare tracks that never reached YouTube often live on SoundCloud or Bandcamp.
 * **You pick the exact match** — `/search` and `/play pick:true` show up to 10 candidates with artist, duration and source, so a wrong auto-match is never forced on you.
-* **Autocomplete that never stalls** — suggestions are served from the in-memory cache only; a cache miss warms it in a bounded background task (max 2 concurrent). Selecting a suggestion submits its **exact URL**, so `/play` resolves that precise track.
+* **Autocomplete that actually fills the dropdown** — cached results are matched by **prefix**, so typing `phir` → `phire` → `phiriye dao` reuses one search instead of starting a new 20 s lookup for every keystroke. On a miss the bot always returns a usable `Search for "…"` choice, and one bounded YouTube-only search (max 2 concurrent, de-duplicated) warms the cache for the next keystroke. Selecting a track submits its **exact URL**, so `/play` resolves that precise result.
+* **Bounded extractors** — each catalogue has a 9 s deadline; a slow SoundCloud lookup is skipped instead of blocking `/play` until the interaction expires. `--socket-timeout 6`, `--retries 1` and `youtube:player_client=tv,web_safari` are passed to search, link resolution **and** songbird's playback extractor; `YT_DLP_ARGS` appends cookies or PO-token providers.
 * **Any link works** — paste YouTube, SoundCloud, Bandcamp, archive.org, a direct `.mp3`/`.flac`/`.ogg`, or a playlist URL. `--flat-playlist` resolves playlists into a full queue.
 * **Cached** — identical queries are free for `SEARCH_CACHE_TTL` seconds; the cache is bounded and purged every 30 s.
 
@@ -507,8 +512,8 @@ Everything below ran on Rust 1.99.0 against the **real crates.io dependency grap
 | `rustfmt --edition 2021 --check src/*.rs` | ✅ clean |
 | `cargo check --offline` | ✅ passes |
 | `cargo clippy --offline --all-targets -- -D warnings` | ✅ zero warnings |
-| `cargo test --offline` | ✅ **13 passed**, 0 failed |
-| `cargo build --release --offline` | ✅ 16 MB stripped binary, links real `libopus` + `davey` |
+| `cargo test --offline` | ✅ **16 passed**, 0 failed |
+| `cargo build --release --offline` | ✅ stripped binary, links real `libopus` + `davey` |
 
 `Cargo.lock` is committed so these exact versions are reproducible. `cargo tree -i davey`
 shows `davey → songbird 0.6.1 → nexcord`. A live Discord voice session cannot be

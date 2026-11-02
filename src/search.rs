@@ -23,6 +23,26 @@ use std::{
 use tokio::{process::Command, time::timeout};
 use tracing::{debug, warn};
 
+/// Hard ceiling for one extractor. Discord gives an interaction ~3 s before
+/// deferral and our dispatcher 30 s overall; a stalled SoundCloud lookup must
+/// never consume that whole budget.
+const PROVIDER_DEADLINE: Duration = Duration::from_secs(9);
+
+/// Baseline flags shared by search, link resolution and songbird playback.
+/// `--socket-timeout`/`--retries` stop a hung extractor; the YouTube player
+/// client list avoids the 2026 "Sign in to confirm you're not a bot" gate on
+/// most IPs. `YT_DLP_ARGS` (cookies, PO-token providers, …) is appended after.
+pub fn default_ytdlp_args() -> Vec<String> {
+    vec![
+        "--socket-timeout".into(),
+        "6".into(),
+        "--retries".into(),
+        "1".into(),
+        "--extractor-args".into(),
+        "youtube:player_client=tv,web_safari".into(),
+    ]
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     YouTube,
@@ -121,7 +141,9 @@ pub struct Searcher {
 }
 
 impl Searcher {
-    pub fn new(program: String, extra: Vec<String>, limit: usize, ttl: Duration) -> Self {
+    pub fn new(program: String, user_args: Vec<String>, limit: usize, ttl: Duration) -> Self {
+        let mut extra = default_ytdlp_args();
+        extra.extend(user_args);
         Self {
             program,
             extra,
@@ -135,13 +157,60 @@ impl Searcher {
         self.cache.lock().map(|c| c.len()).unwrap_or(0)
     }
 
-    /// Cache-only lookup. Autocomplete has a 3 s deadline, so it must never
-    /// shell out to yt-dlp on the request path.
-    pub fn cached(&self, query: &str, provider: Provider) -> Option<Vec<Track>> {
-        let key = format!("{provider:?}|{}", normalize(query));
-        let cache = self.cache.lock().ok()?;
-        let hit = cache.get(&key)?;
-        (hit.at.elapsed() < self.ttl).then(|| hit.tracks.clone())
+    /// Prefix-aware, cache-only suggestions for autocomplete.
+    ///
+    /// The old exact-key lookup meant every keystroke (`phir`, `phire`,
+    /// `phiriye dao`) missed and started a new 20 s search, so the dropdown
+    /// stayed empty. Now a cached result for a longer/shorter version of the
+    /// same query is reused, and the closest-length match wins.
+    pub fn suggestions(&self, query: &str) -> Vec<Track> {
+        let q = normalize(query);
+        if q.len() < 2 {
+            return Vec::new();
+        }
+        let Ok(cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+        let mut best: Option<(&str, &Vec<Track>)> = None;
+        for (key, hit) in cache.iter() {
+            if hit.at.elapsed() >= self.ttl {
+                continue;
+            }
+            let Some((_, cached_q)) = key.split_once('|') else {
+                continue;
+            };
+            if !(cached_q.starts_with(&q) || q.starts_with(cached_q)) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((prev, _)) => cached_q.len().abs_diff(q.len()) < prev.len().abs_diff(q.len()),
+            };
+            if better {
+                best = Some((cached_q, &hit.tracks));
+            }
+        }
+        let Some((_, tracks)) = best else {
+            return Vec::new();
+        };
+        let mut seen: HashSet<String> = HashSet::new();
+        tracks
+            .iter()
+            .filter(|t| seen.insert(t.url.clone()))
+            .take(10)
+            .cloned()
+            .collect()
+    }
+
+    /// Bounded YouTube-only search used to warm autocomplete in the background.
+    /// Results land in the cache under the typed query so the next keystroke can
+    /// show real suggestions instead of an empty dropdown.
+    pub async fn quick_search(&self, query: &str) {
+        let _ = timeout(
+            Duration::from_secs(8),
+            self.search(query, Provider::YouTube),
+        )
+        .await;
     }
 
     pub fn purge(&self) {
@@ -192,30 +261,38 @@ impl Searcher {
 
         let mut all: Vec<Track> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        // Each catalogue gets its own deadline. A timeout is treated as "this
+        // provider has nothing right now", not as a hard failure, so one slow
+        // site can never stall /play for 20 s.
+        let yt = async {
+            timeout(
+                PROVIDER_DEADLINE,
+                self.run("ytsearch", query, Source::YouTube),
+            )
+            .await
+        };
+        let sc = async {
+            timeout(
+                PROVIDER_DEADLINE,
+                self.run("scsearch", query, Source::SoundCloud),
+            )
+            .await
+        };
+
+        let mut collect = |label: &str, outcome: Option<Result<Vec<Track>>>| match outcome {
+            Some(Ok(v)) => all.extend(v),
+            Some(Err(e)) => errors.push(format!("{label}: {e}")),
+            None => debug!("{label} lookup exceeded {PROVIDER_DEADLINE:?}; skipping"),
+        };
+
         match provider {
             Provider::Auto => {
-                // Both extractors run at the same time: wall time = slowest, not sum.
-                let (yt, sc) = tokio::join!(
-                    self.run("ytsearch", query, Source::YouTube),
-                    self.run("scsearch", query, Source::SoundCloud),
-                );
-                match yt {
-                    Ok(v) => all.extend(v),
-                    Err(e) => errors.push(format!("YouTube: {e}")),
-                }
-                match sc {
-                    Ok(v) => all.extend(v),
-                    Err(e) => errors.push(format!("SoundCloud: {e}")),
-                }
+                let (yt, sc) = tokio::join!(yt, sc);
+                collect("YouTube", yt.ok());
+                collect("SoundCloud", sc.ok());
             }
-            Provider::YouTube => match self.run("ytsearch", query, Source::YouTube).await {
-                Ok(v) => all.extend(v),
-                Err(e) => errors.push(format!("YouTube: {e}")),
-            },
-            Provider::SoundCloud => match self.run("scsearch", query, Source::SoundCloud).await {
-                Ok(v) => all.extend(v),
-                Err(e) => errors.push(format!("SoundCloud: {e}")),
-            },
+            Provider::YouTube => collect("YouTube", yt.await.ok()),
+            Provider::SoundCloud => collect("SoundCloud", sc.await.ok()),
         }
 
         if all.is_empty() {
@@ -265,7 +342,7 @@ impl Searcher {
             max.to_string(),
             url.to_owned(),
         ];
-        let out = self.spawn(&args, Duration::from_secs(25)).await?;
+        let out = self.spawn(&args, Duration::from_secs(15)).await?;
         let mut tracks = parse_output(&out, requester);
 
         // Generic audio files sometimes have no extractor metadata at all.
@@ -306,7 +383,7 @@ impl Searcher {
             self.limit.to_string(),
             format!("{prefix}{}:{query}", self.limit),
         ];
-        let out = self.spawn(&args, Duration::from_secs(20)).await?;
+        let out = self.spawn(&args, Duration::from_secs(9)).await?;
         Ok(parse_output(&out, "")
             .into_iter()
             .map(|mut t| {
@@ -592,6 +669,44 @@ mod tests {
         let exact = make("Says", Source::YouTube);
         let wrong = make("Says (Live Bootleg 2011)", Source::YouTube);
         assert!(score("Says", &exact) > score("Says", &wrong));
+    }
+
+    #[test]
+    fn suggestions_reuse_prefixes_and_avoid_duplicates() {
+        let s = Searcher::new("yt-dlp".into(), Vec::new(), 10, Duration::from_secs(600));
+        let track = Track {
+            title: "Phiriye Dao".into(),
+            author: "Miles".into(),
+            url: "https://www.youtube.com/watch?v=abc".into(),
+            thumbnail: None,
+            duration: Some(274.0),
+            source: Source::YouTube,
+            requester: String::new(),
+        };
+        {
+            let mut cache = s.cache.lock().expect("cache lock");
+            cache.insert(
+                "YouTube|phiriye dao".into(),
+                Cached {
+                    at: Instant::now(),
+                    tracks: vec![track.clone(), track],
+                },
+            );
+        }
+        // Every progressive keystroke hits the same cached result.
+        assert_eq!(s.suggestions("phir").len(), 1);
+        assert_eq!(s.suggestions("phiriye").len(), 1);
+        assert_eq!(s.suggestions("phiriye dao").len(), 1);
+        assert!(s.suggestions("something else").is_empty());
+        assert!(s.suggestions("p").is_empty());
+    }
+
+    #[test]
+    fn default_args_harden_youtube_and_bound_sockets() {
+        let args = default_ytdlp_args();
+        assert!(args.contains(&"--socket-timeout".to_owned()));
+        assert!(args.contains(&"--retries".to_owned()));
+        assert!(args.iter().any(|a| a.contains("youtube:player_client")));
     }
 
     #[test]

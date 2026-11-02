@@ -18,7 +18,7 @@ use tracing::warn;
 /// Poise's documented `FrameworkError`/`on_error` contract is that *every*
 /// command produces a reply; we enforce the same invariant here with a hard
 /// deadline so a hung yt-dlp/voice join can never leave a stuck placeholder.
-const INTERACTION_DEADLINE: Duration = Duration::from_secs(25);
+const INTERACTION_DEADLINE: Duration = Duration::from_secs(30);
 const AUTOCOMPLETE_DEADLINE: Duration = Duration::from_secs(3);
 
 async fn bounded<F>(future: F) -> Result<()>
@@ -509,10 +509,15 @@ async fn open_picker(
 
 // ── autocomplete ───────────────────────────────────────────────────────────
 
-/// Never blocks on yt-dlp. Returns whatever is already cached and, on a miss,
-/// warms the cache in a bounded background task for the next keystroke.
-/// Choosing a suggestion submits its exact URL, so `/play` resolves that track
-/// without another fuzzy search.
+/// Autocomplete that actually fills the dropdown.
+///
+/// The old implementation looked up the *exact* query in the cache, so every
+/// keystroke missed, spawned a 20 s two-provider search (capped at two in
+/// flight), and returned an empty response — Discord then showed nothing. Now:
+/// * cached results are matched by prefix, so earlier keystrokes are reused;
+/// * on a miss we **always** return a "Search for …" choice (a real, usable
+///   value that `/play` resolves), so the dropdown is never empty;
+/// * one bounded YouTube-only search warms the cache for the next keystroke.
 async fn handle_autocomplete(
     ctx: &Context,
     cmd: &CommandInteraction,
@@ -530,36 +535,53 @@ async fn handle_autocomplete(
 
     let mut response = CreateAutocompleteResponse::new();
     if focused.chars().count() >= 2 && !util::looks_like_url(focused) {
-        match app.searcher.cached(focused, Provider::Auto) {
-            Some(tracks) => {
-                for track in tracks.iter().take(10) {
-                    let name = util::truncate(
-                        &format!(
-                            "{} · {} · {}",
-                            track.title,
-                            track.author,
-                            util::fmt_secs(track.duration)
-                        ),
-                        100,
-                    );
-                    let value = if track.url.len() <= 100 {
-                        track.url.clone()
-                    } else {
-                        util::truncate(&track.title, 100)
-                    };
-                    response = response.add_string_choice(name, value);
+        let suggestions = app.searcher.suggestions(focused);
+        if suggestions.is_empty() {
+            response = response.add_string_choice(
+                format!("Search for “{}”", util::truncate(focused, 80)),
+                util::truncate(focused, 100),
+            );
+
+            let key = util::normalize(focused);
+            let should_warm = {
+                let mut warming = app.warming.lock().unwrap_or_else(|e| e.into_inner());
+                if warming.contains(&key) || app.inflight.load(Ordering::Relaxed) >= 2 {
+                    false
+                } else {
+                    warming.insert(key.clone());
+                    true
                 }
-            }
-            None if app.inflight.load(Ordering::Relaxed) < 2 => {
+            };
+            if should_warm {
                 app.inflight.fetch_add(1, Ordering::Relaxed);
-                let warm: Arc<AppState> = Arc::clone(app);
+                let warm = Arc::clone(app);
                 let query = focused.to_owned();
                 tokio::spawn(async move {
-                    let _ = warm.searcher.search(&query, Provider::Auto).await;
+                    warm.searcher.quick_search(&query).await;
                     warm.inflight.fetch_sub(1, Ordering::Relaxed);
+                    if let Ok(mut warming) = warm.warming.lock() {
+                        warming.remove(&key);
+                    }
                 });
             }
-            None => {}
+        } else {
+            for track in suggestions.iter().take(10) {
+                let name = util::truncate(
+                    &format!(
+                        "{} · {} · {}",
+                        track.title,
+                        track.author,
+                        util::fmt_secs(track.duration)
+                    ),
+                    100,
+                );
+                let value = if track.url.len() <= 100 {
+                    track.url.clone()
+                } else {
+                    util::truncate(&track.title, 100)
+                };
+                response = response.add_string_choice(name, value);
+            }
         }
     }
 

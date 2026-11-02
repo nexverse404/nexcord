@@ -1,10 +1,21 @@
 //! All embed + component construction lives here, so the design stays in one
 //! place and the rest of the bot never deals with Discord's JSON shapes.
 //!
-//! Aesthetic: dark, low-chroma surfaces; one violet/cyan accent; monospace
-//! metadata; short labels; no decorative clutter. The generated artwork is
-//! embedded at compile time (~100 KB total) and uploaded with the panel message
-//! via `attachment://`, or referenced from a CDN when `ASSET_BASE_URL` is set.
+//! Design language (benchmarked against professional music bots — Chip, Hade,
+//! MusikBot's live player, PlexBot's classic player):
+//!
+//! * one clear hierarchy: header → track title (a link) → one metadata line →
+//!   one progress line → one status line → a small footer;
+//! * **no** blockquotes, no empty `>` spacer lines, no walls of inline-code
+//!   backticks, no spaced-out `N E X C O R D` headers;
+//! * at most **one** image while a track is playing (its album art as a small
+//!   right-hand thumbnail), never a full-width banner *and* a thumbnail;
+//! * plain short labels, bold only for values, two compact button rows.
+//!
+//! Generated artwork is compiled in (~100 KB). Every attachment is referenced
+//! by the embed, because Discord displays any *unreferenced* attachment as a
+//! separate image above the embed. `refresh_panel` also replaces the attachment
+//! set on every edit so a stale file can never linger.
 
 use crate::{
     emojis,
@@ -24,6 +35,8 @@ const WAVE: &[u8] = include_bytes!("../assets/nexcord-wave.jpg");
 const COVER: &[u8] = include_bytes!("../assets/nexcord-cover.jpg");
 
 pub const ACCENT_FALLBACK: u32 = 0x6c5ce7;
+const IDLE_COLOUR: u32 = 0x2b2f3a;
+const PAUSED_COLOUR: u32 = 0xf5a524;
 
 #[derive(Clone, Debug)]
 pub struct Assets {
@@ -46,16 +59,20 @@ impl Assets {
         }
     }
 
-    /// Only needed for messages whose embeds reference `attachment://…`.
-    pub fn attachments(&self) -> Vec<CreateAttachment> {
+    /// Attachments for a panel in a given state. `idle` cards show the generated
+    /// wave banner and cover art; a playing card shows only the small brand icon
+    /// (author/footer) plus the track's own remote album art. Every returned
+    /// file is referenced by `panel_embed`, so none is rendered standalone.
+    pub fn attachments(&self, idle: bool) -> Vec<CreateAttachment> {
         if !self.needs_upload() {
             return Vec::new();
         }
-        vec![
-            CreateAttachment::bytes(MARK.to_vec(), MARK_FILE),
-            CreateAttachment::bytes(WAVE.to_vec(), WAVE_FILE),
-            CreateAttachment::bytes(COVER.to_vec(), COVER_FILE),
-        ]
+        let mut out = vec![CreateAttachment::bytes(MARK.to_vec(), MARK_FILE)];
+        if idle {
+            out.push(CreateAttachment::bytes(WAVE.to_vec(), WAVE_FILE));
+            out.push(CreateAttachment::bytes(COVER.to_vec(), COVER_FILE));
+        }
+        out
     }
 }
 
@@ -86,12 +103,21 @@ impl Tone {
     }
 }
 
+fn header(label: &str, assets: Option<&Assets>) -> CreateEmbedAuthor {
+    let mut author = CreateEmbedAuthor::new(format!("NEXCORD  ·  {label}"));
+    if let Some(assets) = assets {
+        author = author.icon_url(assets.get(MARK_FILE));
+    }
+    author
+}
+
 pub fn notice(title: &str, description: &str, tone: Tone) -> CreateEmbed {
     CreateEmbed::new()
+        .author(header("NOTICE", None))
         .title(format!("{}  {}", emojis::mention(tone.key()), title))
         .description(description)
         .color(tone.colour())
-        .footer(CreateEmbedFooter::new("N E X C O R D  ·  keep it simple"))
+        .footer(CreateEmbedFooter::new("NEXCORD"))
 }
 
 fn button(id: String, slot: &str, label: &str, style: ButtonStyle, disabled: bool) -> CreateButton {
@@ -104,89 +130,93 @@ fn button(id: String, slot: &str, label: &str, style: ButtonStyle, disabled: boo
         .disabled(disabled)
 }
 
+fn state_line(snap: &Snapshot) -> String {
+    let status = if snap.paused { "Paused" } else { "Playing" };
+    let connection = if snap.connected {
+        "Connected"
+    } else {
+        "Offline"
+    };
+    format!(
+        "{} **{}**  ·  {} {}",
+        emojis::mention(if snap.paused { "paused" } else { "playing" }),
+        status,
+        emojis::mention(if snap.connected {
+            "connected"
+        } else {
+            "offline"
+        }),
+        connection,
+    )
+}
+
+fn progress_line(snap: &Snapshot, track: &Track) -> String {
+    let total = track
+        .duration
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .map(Duration::from_secs_f64);
+    format!(
+        "{}  {}  {}",
+        util::fmt_duration(snap.position),
+        util::progress_bar(snap.position, total, 16),
+        util::fmt_duration(total.unwrap_or_default()),
+    )
+}
+
 /// The persistent music control panel.
 pub fn panel_embed(snap: &Snapshot, assets: &Assets, accent: u32) -> CreateEmbed {
     let idle = snap.current.is_none();
     let colour = if idle {
-        Colour::new(0x2b2f3a)
+        Colour::new(IDLE_COLOUR)
     } else if snap.paused {
-        Colour::new(0xf5a524)
+        Colour::new(PAUSED_COLOUR)
     } else {
         Colour::new(accent)
     };
 
     let mut embed = CreateEmbed::new()
-        .author(
-            CreateEmbedAuthor::new("N E X C O R D   /   CONTROL PANEL")
-                .icon_url(assets.get(MARK_FILE)),
-        )
-        .color(colour)
-        .image(assets.get(WAVE_FILE))
-        .thumbnail(
-            snap.current
-                .as_ref()
-                .and_then(|t| t.thumbnail.clone())
-                .unwrap_or_else(|| assets.get(COVER_FILE)),
-        );
+        .author(header("NOW PLAYING", Some(assets)))
+        .color(colour);
 
     if let Some(track) = snap.current.as_ref() {
-        let total = track
-            .duration
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .map(Duration::from_secs_f64);
         let artist = if track.author.is_empty() {
             "Unknown artist"
         } else {
             &track.author
         };
-        let status = format!(
-            "{}  **{}**",
-            emojis::mention(if snap.paused { "paused" } else { "playing" }),
-            if snap.paused { "Paused" } else { "Playing" }
-        );
-        let connection = format!(
-            "{} {}",
-            emojis::mention(if snap.connected {
-                "connected"
-            } else {
-                "offline"
-            }),
-            if snap.connected {
-                "connected"
-            } else {
-                "offline"
-            }
-        );
-        // Named arguments keep the ten placeholders auditable against the
-        // Discord embed limits (description <= 4096 chars).
         let description = format!(
-            "> {status}   ·   {connection}\n\
-             > **{artist}**  ·  `{duration}`  ·  {source_icon}\n>\n\
-             > `{position}`   {bar}   `{total}`\n>\n\
-             > `VOL` **{volume:>3}%**   ·   `LOOP` **{loop_mode}**   ·   `UP NEXT` **{up_next}**",
-            artist = util::clean_md(&util::truncate(artist, 64)),
-            duration = util::fmt_secs(track.duration),
-            source_icon = emojis::mention(track.source.emoji_key()),
-            position = util::fmt_duration(snap.position),
-            bar = util::progress_bar(snap.position, total, 14),
-            total = util::fmt_duration(total.unwrap_or_default()),
-            volume = (snap.volume * 100.0).round() as i32,
-            loop_mode = snap.loop_mode.label(),
-            up_next = snap.queue_len,
+            "{}\n\
+             **{}**  ·  {}  ·  {} {}\n\
+             {}\n\
+             Volume **{}%**  ·  Loop **{}**  ·  **{}** in queue",
+            state_line(snap),
+            util::clean_md(&util::truncate(artist, 64)),
+            util::fmt_secs(track.duration),
+            emojis::mention(track.source.emoji_key()),
+            track.source.label(),
+            progress_line(snap, track),
+            (snap.volume * 100.0).round() as i32,
+            snap.loop_mode.label(),
+            snap.queue_len,
         );
         embed = embed
             .title(util::truncate(&track.title, 100))
             .url(track.url.clone())
             .description(description);
 
+        if let Some(art) = &track.thumbnail {
+            // Remote album art only: no attachment is needed for it.
+            embed = embed.thumbnail(art.clone());
+        }
+
         if !snap.queue.is_empty() {
-            let mut lines = String::new();
+            let mut lines = String::with_capacity(160);
             for (i, next) in snap.queue.iter().take(3).enumerate() {
                 lines.push_str(&format!(
-                    "`{:>2}.`  {}  ·  `{}`\n",
+                    "`{}.` {} — {}\n",
                     i + 1,
-                    util::clean_md(&util::truncate(&next.title, 58)),
-                    util::fmt_secs(next.duration)
+                    util::clean_md(&util::truncate(&next.title, 52)),
+                    util::fmt_secs(next.duration),
                 ));
             }
             if snap.queue_len > 3 {
@@ -196,7 +226,7 @@ pub fn panel_embed(snap: &Snapshot, assets: &Assets, accent: u32) -> CreateEmbed
         }
         embed = embed.footer(
             CreateEmbedFooter::new(format!(
-                "requested by {}   ·   48 kHz stereo Opus   ·   no API keys",
+                "requested by {}  ·  NEXCORD",
                 util::truncate(&track.requester, 40)
             ))
             .icon_url(assets.get(MARK_FILE)),
@@ -204,14 +234,15 @@ pub fn panel_embed(snap: &Snapshot, assets: &Assets, accent: u32) -> CreateEmbed
     } else {
         embed = embed
             .title("Nothing playing")
-            .description(format!(
-                "> {}  **Idle**\n>\n\
-                 > `/play` a song, a link or a playlist — or use `/search` to pick an exact match.\n\
-                 > Works with YouTube, SoundCloud, Bandcamp and 1000+ other sites. No API key needed.",
-                emojis::mention("idle")
-            ))
+            .description(
+                "**Ready when you are.**\n\
+                 `/play` a song, a link or a playlist — or `/search` to pick an exact match.\n\
+                 YouTube, SoundCloud, Bandcamp and 1000+ sites. No API key needed.",
+            )
+            .image(assets.get(WAVE_FILE))
+            .thumbnail(assets.get(COVER_FILE))
             .footer(
-                CreateEmbedFooter::new("N E X C O R D   ·   fast · clean · keyless")
+                CreateEmbedFooter::new("NEXCORD  ·  fast · clean · keyless")
                     .icon_url(assets.get(MARK_FILE)),
             );
     }
@@ -223,7 +254,7 @@ pub fn panel_components(snap: &Snapshot) -> Vec<CreateActionRow> {
     let playing = snap.current.is_some();
     let play_slot = if snap.paused { "play" } else { "pause" };
     let play_label = if snap.paused { "Resume" } else { "Pause" };
-    let loop_label = snap.loop_mode.label();
+    let loop_label = format!("Loop · {}", snap.loop_mode.label());
 
     vec![
         CreateActionRow::Buttons(vec![
@@ -258,7 +289,7 @@ pub fn panel_components(snap: &Snapshot) -> Vec<CreateActionRow> {
             button(
                 "nx:loop".into(),
                 "loop",
-                loop_label,
+                &loop_label,
                 ButtonStyle::Secondary,
                 false,
             ),
@@ -267,14 +298,14 @@ pub fn panel_components(snap: &Snapshot) -> Vec<CreateActionRow> {
             button(
                 "nx:voldown".into(),
                 "volume_down",
-                "−",
+                "Vol −",
                 ButtonStyle::Secondary,
                 false,
             ),
             button(
                 "nx:volup".into(),
                 "volume_up",
-                "+",
+                "Vol +",
                 ButtonStyle::Secondary,
                 false,
             ),
@@ -315,14 +346,19 @@ pub fn queue_pages(len: usize) -> usize {
 
 pub fn queue_embed(snap: &Snapshot, page: usize, pages: usize) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
-        .author(CreateEmbedAuthor::new("N E X C O R D   /   QUEUE"))
+        .author(header("QUEUE", None))
+        .title(format!(
+            "Up next  ·  {} track{}",
+            snap.queue_len,
+            if snap.queue_len == 1 { "" } else { "s" }
+        ))
         .color(Colour::new(ACCENT_FALLBACK));
 
     if let Some(current) = snap.current.as_ref() {
         embed = embed.field(
             "NOW PLAYING",
             format!(
-                "**{}**\n{}  ·  `{}`",
+                "**{}**\n{}  ·  {}",
                 util::clean_md(&util::truncate(&current.title, 90)),
                 util::clean_md(&util::truncate(&current.author, 50)),
                 util::fmt_secs(current.duration)
@@ -332,16 +368,15 @@ pub fn queue_embed(snap: &Snapshot, page: usize, pages: usize) -> CreateEmbed {
     }
 
     if snap.queue.is_empty() {
-        embed = embed.description(
-            "> The queue is empty.\n> `/play` something, or `/search` for an exact match.",
-        );
+        embed = embed
+            .description("The queue is empty. `/play` something, or `/search` for an exact match.");
     } else {
         let start = (page * QUEUE_PER_PAGE).min(snap.queue.len());
         let end = (start + QUEUE_PER_PAGE).min(snap.queue.len());
         let mut lines = String::new();
         for (i, t) in snap.queue[start..end].iter().enumerate() {
             lines.push_str(&format!(
-                "`{:>2}.`  **{}**\n      {}  ·  `{}`  ·  {}\n",
+                "`{:>2}.`  **{}**\n      {}  ·  {}  ·  {}\n",
                 start + i + 1,
                 util::clean_md(&util::truncate(&t.title, 68)),
                 util::clean_md(&util::truncate(&t.author, 42)),
@@ -354,7 +389,7 @@ pub fn queue_embed(snap: &Snapshot, page: usize, pages: usize) -> CreateEmbed {
 
     let total_secs: f64 = snap.queue.iter().filter_map(|t| t.duration).sum();
     embed.footer(CreateEmbedFooter::new(format!(
-        "page {}/{}   ·   {} queued   ·   {} remaining   ·   {} loop",
+        "page {}/{}  ·  {} queued  ·  {} remaining  ·  loop {}",
         page + 1,
         pages,
         snap.queue_len,
@@ -397,30 +432,30 @@ pub fn queue_components(page: usize, pages: usize) -> Vec<CreateActionRow> {
 }
 
 pub fn search_embed(query: &str, tracks: &[Track], provider: Provider) -> CreateEmbed {
-    let mut lines = format!(
-        "> {}  **{}**\n> {}  ·  {} matches  ·  pick the exact one\n\n",
-        emojis::mention("search"),
-        util::clean_md(&util::truncate(query, 90)),
-        provider.label(),
-        tracks.len()
-    );
-    for (i, t) in tracks.iter().enumerate() {
+    let mut lines = String::new();
+    for (i, t) in tracks.iter().take(10).enumerate() {
         lines.push_str(&format!(
-            "`{:>2}.`  [{}]({})\n      {}\n",
+            "`{:>2}.`  [{}]({})\n      {}  ·  {}\n",
             i + 1,
             util::clean_md(&util::truncate(&t.title, 74)),
             t.url,
-            util::clean_md(&util::truncate(&t.subtitle(), 82))
+            util::clean_md(&util::truncate(&t.subtitle(), 70)),
+            util::fmt_secs(t.duration),
         ));
     }
     CreateEmbed::new()
-        .author(CreateEmbedAuthor::new("N E X C O R D   /   SEARCH"))
-        .title("Choose a track")
+        .author(header("SEARCH", None))
+        .title(format!(
+            "Results for “{}”",
+            util::truncate(&util::clean_md(query), 70)
+        ))
         .description(util::truncate(&lines, 3900))
         .color(Colour::new(ACCENT_FALLBACK))
-        .footer(CreateEmbedFooter::new(
-            "exact matches · no API keys · expires in 10 min",
-        ))
+        .footer(CreateEmbedFooter::new(format!(
+            "{}  ·  {} matches  ·  pick one below  ·  expires in 10 min",
+            provider.label(),
+            tracks.len()
+        )))
 }
 
 pub fn search_components(session: &str, tracks: &[Track]) -> Vec<CreateActionRow> {
@@ -475,27 +510,25 @@ pub fn search_components(session: &str, tracks: &[Track]) -> Vec<CreateActionRow
 
 pub fn added_embed(track: &Track, position: usize) -> CreateEmbed {
     let state = if position == 0 {
-        format!("{}  Playing now", emojis::mention("playing"))
+        "Playing now".to_owned()
     } else {
-        format!(
-            "{}  Added to queue  ·  position `{position}`",
-            emojis::mention("added")
-        )
+        format!("Added to queue · position **{position}**")
     };
     CreateEmbed::new()
-        .author(CreateEmbedAuthor::new("N E X C O R D   /   QUEUED"))
+        .author(header("QUEUED", None))
         .title(util::truncate(&track.title, 100))
         .url(track.url.clone())
         .description(format!(
-            "> {state}\n\
-             > **{}**  ·  `{}`  ·  {}\n>\n\
-             > requested by **{}**",
+            "{}  **{}**\n{}  ·  {}  ·  {}\n\nrequested by **{}**",
+            emojis::mention(if position == 0 { "playing" } else { "added" }),
+            state,
             util::clean_md(&util::truncate(&track.author, 64)),
             util::fmt_secs(track.duration),
             track.source.label(),
             util::clean_md(&util::truncate(&track.requester, 40))
         ))
         .color(Colour::new(0x3ddc97))
+        .footer(CreateEmbedFooter::new("NEXCORD"))
 }
 
 /// Compact now-playing card without `attachment://` references, so it can be
@@ -508,37 +541,28 @@ pub fn now_embed(snap: &Snapshot) -> CreateEmbed {
             } else {
                 &track.author
             };
-            let total = track
-                .duration
-                .filter(|d| d.is_finite() && *d > 0.0)
-                .map(Duration::from_secs_f64);
-            let status = format!(
-                "{}  **{}**",
-                emojis::mention(if snap.paused { "paused" } else { "playing" }),
-                if snap.paused { "Paused" } else { "Playing" }
-            );
             let mut embed = CreateEmbed::new()
-                .author(CreateEmbedAuthor::new("N E X C O R D   /   NOW PLAYING"))
+                .author(header("NOW PLAYING", None))
                 .title(util::truncate(&track.title, 100))
                 .url(track.url.clone())
                 .description(format!(
-                    "> {status}  ·  **{artist}**\n\
-                     > `{duration}`  ·  {source}\n>\n\
-                     > `{position}`   {bar}   `{total}`\n>\n\
-                     > `VOL` **{volume}%**   ·   `LOOP` **{loop_mode}**   ·   `UP NEXT` **{up_next}**",
-                    artist = util::clean_md(&util::truncate(artist, 64)),
-                    duration = util::fmt_secs(track.duration),
-                    source = track.source.label(),
-                    position = util::fmt_duration(snap.position),
-                    bar = util::progress_bar(snap.position, total, 14),
-                    total = util::fmt_duration(total.unwrap_or_default()),
-                    volume = (snap.volume * 100.0).round() as i32,
-                    loop_mode = snap.loop_mode.label(),
-                    up_next = snap.queue_len,
+                    "{}\n\
+                     **{}**  ·  {}  ·  {} {}\n\
+                     {}\n\
+                     Volume **{}%**  ·  Loop **{}**  ·  **{}** in queue",
+                    state_line(snap),
+                    util::clean_md(&util::truncate(artist, 64)),
+                    util::fmt_secs(track.duration),
+                    emojis::mention(track.source.emoji_key()),
+                    track.source.label(),
+                    progress_line(snap, track),
+                    (snap.volume * 100.0).round() as i32,
+                    snap.loop_mode.label(),
+                    snap.queue_len,
                 ))
                 .color(Colour::new(ACCENT_FALLBACK))
                 .footer(CreateEmbedFooter::new(format!(
-                    "requested by {}",
+                    "requested by {}  ·  NEXCORD",
                     util::truncate(&track.requester, 48)
                 )));
             if let Some(art) = &track.thumbnail {
@@ -556,9 +580,9 @@ pub fn now_embed(snap: &Snapshot) -> CreateEmbed {
 
 pub fn help_embed() -> CreateEmbed {
     CreateEmbed::new()
-        .author(CreateEmbedAuthor::new("N E X C O R D   /   HELP"))
+        .author(header("HELP", None))
         .title("Everything, in one place")
-        .description("> A keyless music bot. Type a song name, paste a link, or pick an exact result.")
+        .description("A keyless music bot. Type a song name, paste a link, or pick an exact result.")
         .color(Colour::new(ACCENT_FALLBACK))
         .fields(vec![
             (
@@ -576,20 +600,16 @@ pub fn help_embed() -> CreateEmbed {
                 "Searches YouTube **and** SoundCloud in parallel. Paste links from Bandcamp, archive.org, direct audio files, playlists — anything yt-dlp supports. Use `pick:true` or `/search` to choose the exact match.",
                 false,
             ),
-            (
-                "INFO",
-                "`/now` `/stats` `/help`",
-                false,
-            ),
+            ("INFO", "`/now` `/stats` `/help`", false),
         ])
-        .footer(CreateEmbedFooter::new("built in Rust · serenity + songbird · 48 kHz stereo Opus"))
+        .footer(CreateEmbedFooter::new("NEXCORD  ·  built in Rust  ·  48 kHz stereo Opus"))
 }
 
 pub fn stats_embed(fields: Vec<(String, String, bool)>) -> CreateEmbed {
     CreateEmbed::new()
-        .author(CreateEmbedAuthor::new("N E X C O R D   /   STATUS"))
+        .author(header("STATUS", None))
         .title("Runtime")
         .color(Colour::new(ACCENT_FALLBACK))
         .fields(fields)
-        .footer(CreateEmbedFooter::new("lightweight by design"))
+        .footer(CreateEmbedFooter::new("NEXCORD  ·  lightweight by design"))
 }
