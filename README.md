@@ -63,6 +63,49 @@ cargo run --release
 
 Join a voice channel, then `/play a song name` or `/search` and pick the exact result.
 
+### 4. If it doesn't come online
+
+A healthy startup prints these lines in order:
+
+```text
+INFO nexcord: yt-dlp 2026.10.26 ready — keyless search enabled
+INFO nexcord: connecting to Discord…
+INFO nexcord: Discord API reachable — token accepted as @YourBot
+INFO nexcord: opening the Discord gateway…
+INFO nexcord: gateway READY for YourBot — finishing setup
+INFO nexcord: registered 17 slash commands (global scope)
+INFO nexcord: YourBot is online
+```
+
+**If it stops right after the `yt-dlp … ready` line, don't press Ctrl+C.** That is the
+last message before the first HTTPS request to Discord. The startup probe has a
+10 s deadline and the client build a 20 s deadline, so wait ~30 s — you will then
+get either `is online` or a specific error. Serenity's own first request has no
+timeout, which is why older builds could look frozen there.
+
+| What you see | What to do |
+|---|---|
+| `Discord rejected DISCORD_TOKEN (401 Unauthorized)` | Reset the token in **Developer Portal → Bot → Reset Token**, put the new value in `.env`. Never paste a token into a chat or a public issue. |
+| `cannot reach discord.com (…)` / `timed out after 20 s contacting Discord` | Network problem, not a bot problem. Check `curl -vI https://discord.com`, DNS, firewall, proxy/VPN, and any ISP-level filtering. The gateway also needs outbound WSS (`gateway.discord.gg`). |
+| No `registered … slash commands` line | The bot needs the **`applications.commands`** scope. Re-invite with `scope=bot%20applications.commands`. With `GUILD_ID` unset, global registration can take up to ~1 hour; set `GUILD_ID` for instant dev registration. |
+| `yt-dlp --version timed out` | Harmless — only `/play` and `/search` need it, and the check is retried on next start. Install/upgrade with `pip install -U yt-dlp` or point `YT_DLP` at the binary. |
+| Bot is online but `Unknown Interaction` / commands missing | Re-invite with the `applications.commands` scope and re-run so commands register. |
+
+Invite URL (replace `CLIENT_ID`, from Developer Portal → General Information):
+
+```text
+https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot%20applications.commands&permissions=3263488
+```
+
+`permissions=3263488` = view channel · send messages · embed links · attach files ·
+read history · connect · speak. No privileged intents are required.
+
+For a full trace:
+
+```bash
+RUST_LOG=nexcord=debug,serenity=info ./nexcord 2>&1 | tee nexcord.log
+```
+
 ### Docker
 
 ```bash

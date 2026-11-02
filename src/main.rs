@@ -13,7 +13,7 @@ mod search;
 mod ui;
 mod util;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use async_trait::async_trait;
 use player::AppState;
 use serenity::{
@@ -30,9 +30,59 @@ struct Handler {
     app: Arc<AppState>,
 }
 
+/// Serenity's first HTTP request (`/users/@me`, `/gateway/bot`) has neither a
+/// log line nor a timeout, so on a filtered network the process appears to
+/// hang right after the `yt-dlp ready` message. Probe the same endpoint with a
+/// short deadline so a bad token or a blocked network says so out loud.
+async fn check_discord_api(client: &reqwest::Client, token: &str) -> Result<()> {
+    let auth = if token.starts_with("Bot ") {
+        token.to_owned()
+    } else {
+        format!("Bot {token}")
+    };
+    let response = client
+        .get("https://discord.com/api/v10/users/@me")
+        .header(reqwest::header::AUTHORIZATION, auth)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+
+    match response {
+        Ok(resp) => match resp.status().as_u16() {
+            200 => {
+                // reqwest is built without the `json` feature; parse the tiny
+                // response with the serde_json we already depend on.
+                let name = resp
+                    .text()
+                    .await
+                    .ok()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    .and_then(|v| v["username"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "bot".to_owned());
+                info!("Discord API reachable — token accepted as @{name}");
+            }
+            401 => bail!(
+                "Discord rejected DISCORD_TOKEN (401 Unauthorized). Reset it in the \
+                 Developer Portal → Bot → Reset Token and update .env"
+            ),
+            403 => {
+                bail!("Discord returned 403 — DISCORD_TOKEN does not belong to a bot application")
+            }
+            429 => warn!("Discord rate-limited the startup check (429); this is temporary"),
+            code => warn!("Discord API returned HTTP {code} during the startup check"),
+        },
+        Err(e) => warn!(
+            "cannot reach discord.com ({e:#}) — check internet, DNS, firewall, proxy or VPN; \
+             the bot cannot come online until this works"
+        ),
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: SerenityContext, ready: Ready) {
+        info!("gateway READY for {} — finishing setup", ready.user.name);
         // Needed for interaction endpoints on the standalone Http client too.
         self.app.http.set_application_id(ready.application.id);
 
@@ -120,14 +170,25 @@ async fn main() -> Result<()> {
 
     // Only what's needed: guild list + voice states. No message content, no
     // presence intent, no privileged intents, minimal cache pressure.
+    info!("connecting to Discord…");
+    check_discord_api(&app.client, &config.token).await?;
+
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
-    let mut client = Client::builder(config.token.clone(), intents)
+    let build = Client::builder(config.token.clone(), intents)
         .event_handler(Handler { app: app.clone() })
-        .register_songbird_with(voice)
+        .register_songbird_with(voice);
+    let mut client = tokio::time::timeout(Duration::from_secs(20), build)
         .await
+        .context(
+            "timed out after 20 s contacting Discord — see the connectivity warning above \
+             (discord.com must be reachable)",
+        )?
         .context("failed to build the Discord client")?;
 
-    info!("starting Nexcord…");
-    client.start().await?;
+    info!("opening the Discord gateway…");
+    client
+        .start()
+        .await
+        .context("Discord gateway exited before the bot came online")?;
     Ok(())
 }
