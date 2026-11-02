@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NEXCORD · application emoji registry
+# ─────────────────────────────────────────────────────────────────────────────
+# One file, one line per UI slot. Nothing else needs editing to change an icon.
+#
+# Discord "application emojis" are emojis owned by the bot application itself
+# (Developer Portal → your app → Emojis). They work in every server the bot is
+# in, in messages AND in button/select-menu components. No guild permissions,
+# no boost requirement, no upload to each server.
+#
+#   name      = emoji name in your application's emoji library.
+#               2–32 chars, alphanumeric + underscore only.
+#   fallback  = generic Unicode emoji used when no custom emoji is available.
+#               The bot ALWAYS works with zero setup — this is the default.
+#   file      = optional PNG in assets/emojis/, compiled into the binary.
+#               Used only when auto-upload is enabled.
+#   id        = optional numeric emoji ID override. Paste one to point a slot at
+#               a specific emoji (e.g. a guild emoji) and skip the name lookup.
+#
+# Resolution order per slot, at startup:
+#   id  →  application emoji library (matched by name, read-only)
+#       →  upload `file` when auto-upload is on
+#       →  generic Unicode `fallback`
+#
+# Turn uploads on with EMOJI_AUTO_UPLOAD=1 (or auto_upload below). Uploads happen
+# ONCE: existing emojis are matched by name, never duplicated. Any API error
+# degrades to the Unicode fallback instead of failing startup.
+#
+# Set EMOJIS_FILE=/path/to/file.toml to override this file at runtime without
+# rebuilding; the compiled default below is used otherwise.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[meta]
+prefix = "nx_"
+auto_upload = false
+
+[emojis]
+# ── Control panel, row 1 ────────────────────────────────────────────────────
+back         = { name = "nx_back",     fallback = "⏪", file = "nx_back.png" }
+play         = { name = "nx_play",     fallback = "▶️", file = "nx_play.png" }
+pause        = { name = "nx_pause",    fallback = "⏸", file = "nx_pause.png" }
+skip         = { name = "nx_skip",     fallback = "⏭", file = "nx_skip.png" }
+stop         = { name = "nx_stop",     fallback = "⏹", file = "nx_stop.png" }
+loop         = { name = "nx_loop",     fallback = "🔁", file = "nx_loop.png" }
+
+# ── Control panel, row 2 ────────────────────────────────────────────────────
+volume_down  = { name = "nx_vol_down", fallback = "🔉" }
+volume_up    = { name = "nx_vol_up",   fallback = "🔊" }
+shuffle      = { name = "nx_shuffle",  fallback = "🔀", file = "nx_shuffle.png" }
+queue        = { name = "nx_queue",    fallback = "📜", file = "nx_queue.png" }
+refresh      = { name = "nx_refresh",  fallback = "🔄", file = "nx_refresh.png" }
+
+# ── Queue pagination / search picker ───────────────────────────────────────
+prev         = { name = "nx_prev",     fallback = "◀" }
+next         = { name = "nx_next",     fallback = "▶" }
+page         = { name = "nx_page",     fallback = "📄" }
+close        = { name = "nx_close",    fallback = "✖" }
+cancel       = { name = "nx_cancel",   fallback = "✖" }
+top          = { name = "nx_top",      fallback = "⚡" }
+search       = { name = "nx_search",   fallback = "🔎", file = "nx_search.png" }
+
+# ── Ephemeral toast tones ───────────────────────────────────────────────────
+neutral      = { name = "nx_neutral",  fallback = "✦" }
+good         = { name = "nx_good",     fallback = "✓" }
+warn         = { name = "nx_warn",     fallback = "!" }
+bad          = { name = "nx_bad",      fallback = "✕" }
+
+# ── Status text inside embeds (aliases reuse panel icons) ───────────────────
+playing      = { name = "nx_play",     fallback = "▶️", file = "nx_play.png" }
+paused       = { name = "nx_pause",    fallback = "⏸", file = "nx_pause.png" }
+connected    = { name = "nx_connected",fallback = "🟢" }
+offline      = { name = "nx_offline",  fallback = "⚪" }
+idle         = { name = "nx_idle",     fallback = "⚪" }
+added        = { name = "nx_queue",    fallback = "📥", file = "nx_queue.png" }
+
+# ── Source badges ───────────────────────────────────────────────────────────
+youtube      = { name = "nx_youtube",  fallback = "▶️" }
+soundcloud   = { name = "nx_soundcloud", fallback = "☁️" }
+direct       = { name = "nx_direct",   fallback = "🎵" }
+link         = { name = "nx_link",     fallback = "🔗" }

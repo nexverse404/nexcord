@@ -1,0 +1,16 @@
+services:
+  nexcord:
+    build: .
+    image: nexcord:latest
+    container_name: nexcord
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Edit emojis.toml without rebuilding the image.
+      - ./emojis.toml:/app/emojis.toml:ro
+    environment:
+      EMOJIS_FILE: /app/emojis.toml
+      RUST_LOG: "nexcord=info,songbird=warn,serenity=warn"
+      YT_DLP: "yt-dlp"
+    # yt-dlp is updated inside the image; rebuild periodically to refresh it.
+    stop_grace_period: 10s
