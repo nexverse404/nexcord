@@ -1,7 +1,11 @@
 # NEXCORD
 
-> A fast, minimal, high-fidelity Discord music bot written in **Rust**.
+> A fast, minimal, high-fidelity Discord music bot written in **Rust** (edition 2024).
 > Slash commands · button control panel · keyless accurate search · original artwork.
+>
+> **Voice uses DAVE (Discord's mandatory E2EE).** Since 1 March 2026 Discord closes
+> non-DAVE voice connections with code `4017`; this build is pinned to
+> `songbird 0.6.1`, which implements DAVE via the pure-Rust `davey` crate.
 
 ![Nexcord mark](assets/nexcord-mark.jpg)
 
@@ -90,6 +94,9 @@ timeout, which is why older builds could look frozen there.
 | No `registered … slash commands` line | The bot needs the **`applications.commands`** scope. Re-invite with `scope=bot%20applications.commands`. With `GUILD_ID` unset, global registration can take up to ~1 hour; set `GUILD_ID` for instant dev registration. |
 | `yt-dlp --version timed out` | Harmless — only `/play` and `/search` need it, and the check is retried on next start. Install/upgrade with `pip install -U yt-dlp` or point `YT_DLP` at the binary. |
 | Bot is online but `Unknown Interaction` / commands missing | Re-invite with the `applications.commands` scope and re-run so commands register. |
+| `couldn't join voice … 4017 … E2EE/DAVE protocol required` | You are running an **old binary**. `git pull` and `cargo build --release` — this build pins `songbird 0.6.1` (DAVE). See [Voice & DAVE](#voice--dave). |
+| A private "Nexcord is thinking…" that never resolves | Fixed in this build: every interaction has a 25 s deadline and always produces a reply (`edit_response`, falling back to `create_followup`). If it persists, check the log for `/play failed`. |
+| `/play` finds a track but nothing plays | Check `yt-dlp` on the host (`YT_DLP_ARGS` for cookies / PO tokens). The bot now listens for `TrackEvent::Error` and advances the queue instead of freezing. |
 
 Invite URL (replace `CLIENT_ID`, from Developer Portal → General Information):
 
@@ -321,6 +328,29 @@ Empty queue → `> The queue is empty.` / `> /play something, or /search for an 
 
 ---
 
+## Voice & DAVE
+
+Discord made **DAVE** (Discord Audio & Video End-to-End Encryption) mandatory for
+all non-Stage voice calls on **1 March 2026**. An unencrypted voice Identify is
+rejected with WebSocket close code **4017 — "E2EE/DAVE protocol required"**
+([Discord status codes](https://docs.discord.com/developers/topics/opcodes-and-status-codes),
+[announcement](https://discord.com/blog/bringing-dave-to-all-discord-platforms)).
+
+`songbird 0.5.0` predates DAVE. This project pins **`songbird 0.6.1`** (v0.6.0,
+2026-04-05 added DAVE support), whose voice Identify advertises
+`max_dave_protocol_version` and encrypts media through `davey` (pure Rust, no
+C++ toolchain). `serenity` is pinned to `0.12.5`, the version Poise 0.7.1 builds
+against. Startup confirms it:
+
+```text
+INFO nexcord: voice engine ready — songbird 0.6.1 with DAVE (E2EE) support
+```
+
+If you see 4017 you are running a stale binary — rebuild. `libopus` (static or
+shared) is still required at build time: `opus2`/`libopus_sys` link it.
+
+---
+
 ## Audio quality notes
 
 * Songbird's `YoutubeDl` input runs `yt-dlp -f ba[abr>0][vcodec=none]/best`, i.e. the **best audio-only** stream. When that stream is Opus-in-WebM, frames are passed through to Discord **without a lossy transcode**.
@@ -417,6 +447,7 @@ needs no rebuild. `/stats` shows how many custom slots are live.
 | `OPUS_BITRATE` | `160000` | 32 000–384 000 bps |
 | `ACCENT` | `0x6C5CE7` | Embed accent colour |
 | `ASSET_BASE_URL` | empty | Optional CDN base URL |
+| `YT_DLP_ARGS` | empty | Extra flags for every yt-dlp call (cookies, PO tokens, extractor args) |
 | `EMOJI_AUTO_UPLOAD` | `0` | `1` uploads missing application emojis once at startup |
 | `EMOJIS_FILE` | compiled `emojis.toml` | Runtime override for the emoji registry |
 | `RUST_LOG` | `nexcord=info,...` | tracing filter |
@@ -441,6 +472,7 @@ assets/               original generated artwork (compiled in)
 assets/emojis/        10 transparent gradient application-emoji PNGs
 scripts/              offline toolchain bootstrap + emoji upload helper
 REVIEW.md             two-pass (Discord dev/user, Rust dev) review record
+AUDIT.md              line-by-line audit, documentation sources, wiring map
 ```
 
 State is an `Arc<AppState>` with a small `RwLock<HashMap<GuildId, Arc<Mutex<GuildState>>>>`. One global `TrackEvent::End` listener per voice call advances the queue from a spawned task, so no work happens inside the audio mixer. Stale end events from skipped tracks are ignored by comparing the track UUID.
@@ -468,7 +500,7 @@ rustc --version   # rustc 1.99.0
 
 ### Verification (full, dependency-linked)
 
-Everything below ran on Rust 1.99.0 against the **real crates.io dependency graph** — 375 locked packages including `serenity 0.12.4`, `songbird 0.5.0`, `tokio 1.54.1`, `reqwest 0.12.28` and `toml 0.8.23` — not stubs:
+Everything below ran on Rust 1.99.0 against the **real crates.io dependency graph** — 443 vendored packages including `serenity 0.12.5`, `songbird 0.6.1`, `davey 0.1.5`, `opus2 0.4.0`, `libopus_sys 0.3.3`, `tokio`, `reqwest` and `toml` — not stubs. Edition 2024 (`rust-version = 1.85`):
 
 | Check | Result |
 |---|---|
@@ -476,9 +508,12 @@ Everything below ran on Rust 1.99.0 against the **real crates.io dependency grap
 | `cargo check --offline` | ✅ passes |
 | `cargo clippy --offline --all-targets -- -D warnings` | ✅ zero warnings |
 | `cargo test --offline` | ✅ **13 passed**, 0 failed |
-| `cargo build --release --offline` | ✅ 14 MB stripped binary, links successfully |
+| `cargo build --release --offline` | ✅ 16 MB stripped binary, links real `libopus` + `davey` |
 
-`Cargo.lock` is committed so these exact versions are reproducible.
+`Cargo.lock` is committed so these exact versions are reproducible. `cargo tree -i davey`
+shows `davey → songbird 0.6.1 → nexcord`. A live Discord voice session cannot be
+tested in this sandbox (`discord.com` egress is blocked), so DAVE negotiation and
+audio output must be confirmed on a machine with a valid token and a joined VC.
 
 ### Building on a restricted network
 
@@ -499,7 +534,7 @@ The build sandbox blocks `static.rust-lang.org` and `index.crates.io` at the TLS
 
    In this sandbox the vendor tree was produced by a temporary GitHub Actions workflow (runners have unrestricted egress) and relayed back through the repository, then removed.
 
-3. **libopus** — songbird's `audiopus_sys` needs Opus. With no apt/pkg-config available it was built from the upstream `xiph/opus` source (CMake from PyPI) and exposed via `LIBOPUS_NO_PKG=1` + `LIBOPUS_LIB_DIR=/path/to/prefix`. On a normal machine just install `libopus-dev` and `pkg-config`.
+3. **libopus** — songbird 0.6 uses `opus2` → `libopus_sys`. With no apt/pkg-config available it was built from the upstream `xiph/opus` source (CMake from PyPI) and exposed via `LIBOPUS_NO_PKG=1` + `LIBOPUS_LIB_DIR=/path/to/prefix`. `opus2` enables **static** linking by default, so the prefix needs `lib/libopus.a` as well (build once with `-DBUILD_SHARED_LIBS=OFF`). On a normal machine just install `libopus-dev` and `pkg-config`.
 
 ```bash
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && cargo build --release

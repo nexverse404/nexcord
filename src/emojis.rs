@@ -15,7 +15,7 @@
 //! wide and immutable after startup: a `RwLock` gives cheap `Send + Sync`
 //! reads without threading a handle through every `ui::` call site.
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use serde::Deserialize;
 use serenity::{http::Http, model::prelude::*};
@@ -23,8 +23,8 @@ use std::{
     collections::HashMap,
     env, fs,
     sync::{
-        atomic::{AtomicBool, Ordering},
         OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 use tracing::{debug, info, warn};

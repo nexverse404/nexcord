@@ -1,8 +1,8 @@
 [package]
 name = "nexcord"
-version = "1.0.0"
-edition = "2021"
-rust-version = "1.82"
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.85"
 description = "A fast, minimal, high-quality Discord music bot in Rust. No API keys."
 license = "GPL-3.0-only"
 repository = "https://github.com/nexverse404/nexcord"
@@ -16,7 +16,8 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serenity = { version = "=0.12.4", default-features = false, features = [
+# 0.12.5 is the current 0.12 line and the version Poise 0.7.1 is built against.
+serenity = { version = "=0.12.5", default-features = false, features = [
     "client",
     "gateway",
     "model",
@@ -24,14 +25,15 @@ serenity = { version = "=0.12.4", default-features = false, features = [
     "voice",
     "rustls_backend",
 ] }
-songbird = { version = "=0.5.0", default-features = false, features = [
+# 0.6.0 added Discord's mandatory DAVE (E2EE) voice protocol. 0.5.x is
+# rejected by Discord with voice close code 4017.
+songbird = { version = "=0.6.1", default-features = false, features = [
     "driver",
     "gateway",
     "rustls",
     "serenity",
     "tungstenite",
 ] }
-toml = "0.8"
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
@@ -42,6 +44,7 @@ tokio = { version = "1", features = [
     "fs",
     "io-util",
 ] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -56,3 +59,6 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+[lints.rust]
+unsafe_code = "forbid"
