@@ -8,9 +8,9 @@ runtime unless `ASSET_BASE_URL` is set.
 
 | File | Format / size | Used as |
 |---|---|---|
-| `nexcord-mark.jpg` | JPEG · 512×512 · 27.2 KB | author + footer icon on every embed, bot avatar |
-| `nexcord-wave.jpg` | JPEG · 1200×396 · 36.5 KB | full-width banner on the control panel |
-| `nexcord-cover.jpg` | JPEG · 512×512 · 36.7 KB | thumbnail when a track has no artwork |
+| `nexcord-mark.jpg` | JPEG · 512×512 · 27.2 KB | author + footer icon on the control panel, bot avatar |
+| `nexcord-wave.jpg` | JPEG · 1200×396 · 36.5 KB | full-width banner on the **idle** control panel only |
+| `nexcord-cover.jpg` | JPEG · 512×512 · 36.7 KB | thumbnail on the **idle** control panel; a playing track shows its own remote album art instead |
 
 Total **108 KB**. Referenced from `src/ui.rs` via `include_bytes!`, uploaded once
 with the panel message as `attachment://…`, or served from a CDN when

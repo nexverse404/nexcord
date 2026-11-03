@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use serenity::{
-    builder::{CreateActionRow, CreateEmbed, CreateMessage, EditMessage},
+    builder::{CreateActionRow, CreateEmbed, CreateMessage, EditAttachments, EditMessage},
     client::Context,
     http::Http,
     model::prelude::{ChannelId, GuildId, MessageId, UserId},
@@ -26,7 +26,7 @@ use songbird::{
     tracks::TrackHandle,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -93,6 +93,8 @@ pub struct GuildState {
     /// Monotonic stamp used to coalesce concurrent panel refreshes so a burst
     /// of button presses cannot burn the message-edit rate limit.
     pub panel_gen: u64,
+    /// Guards against two concurrent refreshes each posting a *second* panel.
+    pub posting: bool,
     pub last_active: Instant,
 }
 
@@ -113,6 +115,7 @@ impl GuildState {
             voice_channel: None,
             queue_page: 0,
             panel_gen: 0,
+            posting: false,
             last_active: Instant::now(),
         }
     }
@@ -159,8 +162,9 @@ pub struct AppState {
     pub assets: Assets,
     pub started: Instant,
     /// Caps background autocomplete searches so rapid typing can't spawn a
-    /// stampede of yt-dlp processes.
+    /// stampede of yt-dlp processes; `warming` de-duplicates identical queries.
     pub inflight: AtomicUsize,
+    pub warming: StdMutex<HashSet<String>>,
     guilds: RwLock<HashMap<GuildId, Arc<Mutex<GuildState>>>>,
     sessions: StdMutex<HashMap<String, SearchSession>>,
     seq: AtomicU64,
@@ -186,6 +190,7 @@ impl AppState {
             assets,
             started: Instant::now(),
             inflight: AtomicUsize::new(0),
+            warming: StdMutex::new(HashSet::new()),
             guilds: RwLock::new(HashMap::new()),
             sessions: StdMutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
@@ -387,9 +392,12 @@ impl AppState {
         let input: Input = if track.source == Source::Direct {
             HttpRequest::new(self.client.clone(), track.url.clone()).into()
         } else {
+            let mut ytdlp_args = vec!["--no-config".to_owned()];
+            ytdlp_args.extend(crate::search::default_ytdlp_args());
+            ytdlp_args.extend(self.config.yt_dlp_args.iter().cloned());
             let source: YoutubeDl<'static> =
                 YoutubeDl::new_ytdl_like(self.ytdl_program, self.client.clone(), track.url.clone())
-                    .user_args(self.config.yt_dlp_args.clone());
+                    .user_args(ytdlp_args);
             source.into()
         };
         let handle = {
@@ -410,6 +418,39 @@ impl AppState {
         }
         self.refresh_panel(guild_id).await;
         Ok(())
+    }
+
+    /// `yt-dlp` failed to resolve the stream. Without a message the user sees a
+    /// silent queue advance; with one they get an actionable fix.
+    pub async fn on_track_error(&self, guild_id: GuildId, uuid: &str) {
+        let state = self.guild(guild_id).await;
+        let (matches, channel, title) = {
+            let st = state.lock().await;
+            (
+                st.current_uuid.as_deref() == Some(uuid),
+                st.text_channel,
+                st.current.as_ref().map(|t| t.title.clone()),
+            )
+        };
+        if !matches {
+            return;
+        }
+        let track_name = title.unwrap_or_else(|| "that track".to_owned());
+        warn!(%guild_id, %uuid, %track_name, "track failed to start; advancing queue");
+        if let Some(channel) = channel {
+            let notice = ui::notice(
+                "Couldn't play that track",
+                &format!(
+                    "**{}** could not be resolved by yt-dlp. On this host run                      `yt-dlp -g \"<url>\"` to see the extractor error — YouTube may                      need `YT_DLP_ARGS` (cookies or a player-client override).                      Skipping to the next track.",
+                    util::clean_md(&util::truncate(&track_name, 70))
+                ),
+                ui::Tone::Bad,
+            );
+            let _ = channel
+                .send_message(self.http.clone(), CreateMessage::new().embed(notice))
+                .await;
+        }
+        self.on_track_end(guild_id, uuid).await;
     }
 
     /// Fired from a spawned task, never from inside the audio mixer itself.
@@ -721,8 +762,13 @@ impl AppState {
         }
     }
 
-    /// Edit the persistent panel in place. Discord keeps existing attachments
-    /// when the `attachments` field is omitted, so the artwork is uploaded once.
+    /// Edit the persistent panel in place.
+    ///
+    /// Two real bugs were fixed here: the old code attached three files but
+    /// only referenced two in a playing embed, so Discord rendered the spare
+    /// cover as a big standalone image above the message; and two concurrent
+    /// refreshes could each post a second panel. Every edit now replaces the
+    /// attachment set explicitly and posting is guarded by `posting`.
     pub async fn refresh_panel(&self, guild_id: GuildId) {
         let generation = {
             let state = self.guild(guild_id).await;
@@ -737,27 +783,37 @@ impl AppState {
         if state.lock().await.panel_gen != generation {
             return;
         }
+        let idle = snap.current.is_none();
         let embed = ui::panel_embed(&snap, &self.assets, self.config.accent);
         let components = ui::panel_components(&snap);
-        // The snapshot already carries the panel's own channel and message, so
-        // no second mutex acquisition is needed here.
         let channel = snap.text_channel;
 
         if let Some(panel) = snap.panel {
+            // `EditAttachments::new()` removes all old attachments; adding only
+            // the current set guarantees no stale file survives an edit.
+            let mut files = EditAttachments::new();
+            for attachment in self.assets.attachments(idle) {
+                files = files.add(attachment);
+            }
             let edit = EditMessage::new()
                 .embed(embed.clone())
-                .components(components.clone());
+                .components(components.clone())
+                .attachments(files);
             match panel
                 .channel_id
                 .edit_message(self.http.clone(), panel.message_id, edit)
                 .await
             {
                 Ok(_) => return,
-                Err(e) => debug!(%guild_id, "panel message gone, recreating: {e:?}"),
+                Err(e) => {
+                    debug!(%guild_id, "panel message gone, recreating: {e:?}");
+                    state.lock().await.panel = None;
+                }
             }
         }
         if let Some(channel) = channel {
-            self.post_panel(guild_id, channel, embed, components).await;
+            self.post_panel(guild_id, channel, embed, components, idle)
+                .await;
         }
     }
 
@@ -767,15 +823,26 @@ impl AppState {
         channel: ChannelId,
         embed: CreateEmbed,
         components: Vec<CreateActionRow>,
+        idle: bool,
     ) {
+        let state = self.guild(guild_id).await;
+        {
+            let mut st = state.lock().await;
+            if st.posting || st.panel.is_some() {
+                return;
+            }
+            st.posting = true;
+        }
         let mut message = CreateMessage::new().embed(embed).components(components);
-        for attachment in self.assets.attachments() {
+        for attachment in self.assets.attachments(idle) {
             message = message.add_file(attachment);
         }
-        match channel.send_message(self.http.clone(), message).await {
+        let outcome = channel.send_message(self.http.clone(), message).await;
+        let mut st = state.lock().await;
+        st.posting = false;
+        match outcome {
             Ok(sent) => {
-                let state = self.guild(guild_id).await;
-                state.lock().await.panel = Some(PanelRef {
+                st.panel = Some(PanelRef {
                     channel_id: channel,
                     message_id: sent.id,
                 });
@@ -784,9 +851,17 @@ impl AppState {
         }
     }
 
+    /// Replace the panel: delete the old message first so `/panel` never leaves
+    /// two "NEXCORD / CONTROL PANEL" cards in the channel.
     pub async fn reset_panel(&self, guild_id: GuildId) {
         let state = self.guild(guild_id).await;
-        state.lock().await.panel = None;
+        let old = state.lock().await.panel.take();
+        if let Some(panel) = old {
+            let _ = self
+                .http
+                .delete_message(panel.channel_id, panel.message_id, None)
+                .await;
+        }
         self.refresh_panel(guild_id).await;
     }
 
@@ -909,11 +984,10 @@ impl VoiceEventHandler for TrackErrorHandler {
         if let EventContext::Track(list) = ctx {
             for pair in *list {
                 let uuid = pair.1.uuid().to_string();
-                warn!(guild_id = %self.guild_id, %uuid, "track failed to start; advancing queue");
                 let app = self.app.clone();
                 let guild_id = self.guild_id;
                 tokio::spawn(async move {
-                    app.on_track_end(guild_id, &uuid).await;
+                    app.on_track_error(guild_id, &uuid).await;
                 });
             }
         }

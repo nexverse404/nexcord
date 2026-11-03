@@ -87,3 +87,22 @@ Re-verified against the real 443-package graph on Rust 1.99.0:
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, 13 tests,
 `cargo build --release` (16 MB, links `libopus` and `davey`). Live DAVE
 negotiation still needs a real Discord voice session.
+
+
+## Fourth pass: runtime UX report (autocomplete, timeouts, ugly panel)
+
+The user sent a real screenshot and log: `/play` timed out, a track failed to
+start, autocomplete showed nothing, the progress bar rendered as empty boxes,
+an unreferenced cover image appeared above the embed, and two control panels
+were posted in the same channel. Professional players (Chip, Hade, MusikBot's
+live player, PlexBot's classic player) were used as the visual reference.
+
+| Pass | Finding / fix |
+|---|---|
+| Discord dev + user | Autocomplete was an exact-key cache lookup, so every keystroke missed and started a 20 s two-provider search — the dropdown stayed empty. Now prefix-matched, always returns a usable choice, and warms with one bounded YouTube-only search. Rebuilt the panel to the professional hierarchy (header → title → metadata → progress → status → footer), removed quote blocks / inline-code walls / spaced headers, one image while playing, and relabelled buttons (`Loop · Off`, `Vol −/+`). Added troubleshooting rows for every reported symptom. |
+| Rust dev | Per-provider 9 s deadlines (a slow SoundCloud no longer eats the 30 s interaction budget), shared hardened yt-dlp flags for search/resolve/playback, `EditAttachments::new()` on every panel edit so stale files are removed, a `posting` guard + deleting the old card in `reset_panel` so only one panel exists, and a `TrackEvent::Error` path that posts an actionable notice instead of silently advancing. `▰▱` → `━●─` progress bar with a fixed-width unit test; prefix-suggestion and default-arg unit tests. |
+
+Re-verified on the real 443-package graph: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, 16 tests, release build. Live
+Discord rendering still requires the user's client; the README's embed examples
+are faithful text renderings of the new builders.
